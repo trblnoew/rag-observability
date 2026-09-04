@@ -1,0 +1,88 @@
+spring:
+    application:
+        name: rag-observability
+    config:
+        import: optional:file:.env[.properties]
+    datasource:
+        url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:rag_observability}
+        username: ${DB_USER:rag_app}
+        password: ${DB_PASSWORD:rag_local_password}
+        hikari:
+            connection-timeout: 3000
+            maximum-pool-size: 10
+    flyway:
+        enabled: true
+        locations: classpath:db/migration
+    servlet:
+        multipart:
+            max-file-size: 1MB
+            max-request-size: 2MB
+    jackson:
+        deserialization:
+            fail-on-unknown-properties: true
+    ai:
+        model:
+            chat: ${SPRING_AI_MODEL_CHAT:none}
+            embedding: ${SPRING_AI_MODEL_EMBEDDING:none}
+        openai:
+            api-key: ${OPENAI_API_KEY:}
+            chat:
+                options:
+                    model: ${CHAT_MODEL:gpt-4.1-mini}
+            embedding:
+                options:
+                    model: ${EMBEDDING_MODEL:text-embedding-3-small}
+                    dimensions: ${EMBEDDING_DIMENSIONS:1536}
+
+server:
+    shutdown: graceful
+
+management:
+    endpoints:
+        web:
+            exposure:
+                include: health,info
+    endpoint:
+        health:
+            probes:
+                enabled: true
+            show-details: always
+    tracing:
+        sampling:
+            probability: ${OTEL_TRACES_SAMPLER_PROBABILITY:1.0}
+    otlp:
+        tracing:
+            endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+    observations:
+        key-values:
+            service.name: ${spring.application.name}
+
+rag:
+    chunking:
+        chunk-size-tokens: ${RAG_CHUNK_SIZE_TOKENS:600}
+        max-chunks-per-document: ${RAG_MAX_CHUNKS_PER_DOCUMENT:500}
+    embedding:
+        provider: ${SPRING_AI_MODEL_EMBEDDING:none}
+        api-key: ${OPENAI_API_KEY:}
+        base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+        model: ${EMBEDDING_MODEL:text-embedding-3-small}
+        dimensions: ${EMBEDDING_DIMENSIONS:1536}
+        batch-size: ${RAG_EMBEDDING_BATCH_SIZE:32}
+        connect-timeout: ${RAG_EMBEDDING_CONNECT_TIMEOUT:3s}
+        read-timeout: ${RAG_EMBEDDING_READ_TIMEOUT:30s}
+    retrieval:
+        top-k: ${RAG_RETRIEVAL_TOP_K:5}
+        minimum-similarity: ${RAG_RETRIEVAL_MIN_SIMILARITY:0.0}
+    generation:
+        provider: ${SPRING_AI_MODEL_CHAT:none}
+        api-key: ${OPENAI_API_KEY:}
+        base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+        model: ${CHAT_MODEL:gpt-4.1-mini}
+        connect-timeout: ${RAG_GENERATION_CONNECT_TIMEOUT:3s}
+        read-timeout: ${RAG_GENERATION_READ_TIMEOUT:60s}
+        max-output-tokens: ${RAG_GENERATION_MAX_OUTPUT_TOKENS:600}
+        temperature: 0.0
+    answer:
+        minimum-similarity: ${RAG_ANSWER_MINIMUM_SIMILARITY:0.5}
+        source-excerpt-length: ${RAG_SOURCE_EXCERPT_LENGTH:500}
+
