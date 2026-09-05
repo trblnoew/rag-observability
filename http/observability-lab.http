@@ -1,0 +1,77 @@
+@baseUrl = http://localhost:8080
+
+# 서버 코드를 수정한 뒤에는 실행 중인 Spring Boot를 종료하고 다시 시작하세요.
+# Health에는 X-Trace-Id가 없습니다. 아래 Search/Answer 응답에서 확인합니다.
+
+### 1. Health
+GET {{baseUrl}}/actuator/health
+
+### 2. Search (one paid Query Embedding when OpenAI is enabled)
+POST {{baseUrl}}/api/v1/search
+Content-Type: application/json
+
+{"query":"HikariCP connection timeout 발생 시 무엇을 확인하나요?","topK":5,"minimumSimilarity":-1.0}
+
+> {%
+    const traceId = response.headers.valueOf("X-Trace-Id");
+    client.global.clear("searchTraceId");
+    if (traceId) {
+        client.global.set("searchTraceId", traceId);
+        client.log("Search Trace ID: " + traceId);
+    } else {
+        client.log("X-Trace-Id 헤더 없음: Spring Boot를 최신 코드로 재시작하고 management.tracing.enabled 설정을 확인하세요.");
+    }
+    client.test("Search 응답에 Trace ID가 존재한다", function () {
+        client.assert(!!traceId, "응답 헤더에 X-Trace-Id가 없습니다. 서버 재시작/관측성 설정을 확인하세요.");
+    });
+%}
+
+### 3. Answer (Query Embedding + Generation when evidence exists)
+POST {{baseUrl}}/api/v1/answers
+Content-Type: application/json
+
+{"question":"HikariCP connection timeout 발생 시 무엇을 확인하나요?","topK":5,"minimumSimilarity":0.5}
+
+> {%
+    const traceId = response.headers.valueOf("X-Trace-Id");
+    client.global.clear("answerTraceId");
+    if (traceId) {
+        client.global.set("answerTraceId", traceId);
+        client.log("Answer Trace ID: " + traceId);
+    } else {
+        client.log("X-Trace-Id 헤더 없음: Spring Boot를 최신 코드로 재시작하고 management.tracing.enabled 설정을 확인하세요.");
+    }
+    client.test("Answer 응답에 Trace ID가 존재한다", function () {
+        client.assert(!!traceId, "응답 헤더에 X-Trace-Id가 없습니다. 서버 재시작/관측성 설정을 확인하세요.");
+    });
+%}
+
+### 4. No evidence candidate (inspect results; absence is not guaranteed for arbitrary corpus)
+POST {{baseUrl}}/api/v1/answers
+Content-Type: application/json
+
+{"question":"연차 신청은 누구에게 승인받아야 하나요?","minimumSimilarity":0.5}
+
+> {%
+    const traceId = response.headers.valueOf("X-Trace-Id");
+    client.global.clear("noEvidenceTraceId");
+    if (traceId) {
+        client.global.set("noEvidenceTraceId", traceId);
+        client.log("No-evidence Trace ID: " + traceId);
+    } else {
+        client.log("X-Trace-Id 헤더 없음: Spring Boot를 최신 코드로 재시작하고 management.tracing.enabled 설정을 확인하세요.");
+    }
+    client.test("No-evidence 응답에 Trace ID가 존재한다", function () {
+        client.assert(!!traceId, "응답 헤더에 X-Trace-Id가 없습니다. 서버 재시작/관측성 설정을 확인하세요.");
+    });
+%}
+
+### 5. Validation error (no paid call)
+POST {{baseUrl}}/api/v1/search
+Content-Type: application/json
+
+{"query":"","topK":0}
+
+### 6. Tempo trace (wait briefly for asynchronous export)
+GET http://localhost:3200/api/traces/{{answerTraceId}}
+Accept: application/json

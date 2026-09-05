@@ -12,8 +12,9 @@ out/
 
 tmp/
 
+evaluation/results/
+
 ### OS files ###
 .DS_Store
 Thumbs.db
 Desktop.ini
-

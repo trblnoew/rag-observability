@@ -22,6 +22,7 @@ public class RagService {
     private final RagPromptBuilder promptBuilder;
     private final CitationValidator citationValidator;
     private final AnswerProperties answerProperties;
+    private final com.portfolio.ragobservability.observability.RagTracing tracing;
 
     public RagService(
             RetrievalService retrievalService,
@@ -30,18 +31,32 @@ public class RagService {
             RagPromptBuilder promptBuilder,
             CitationValidator citationValidator,
             AnswerProperties answerProperties) {
+        this(retrievalService, generationGateway, contextBuilder, promptBuilder, citationValidator, answerProperties,
+                new com.portfolio.ragobservability.observability.RagTracing(null));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RagService(RetrievalService retrievalService, GenerationGateway generationGateway,
+            ContextBuilder contextBuilder, RagPromptBuilder promptBuilder, CitationValidator citationValidator,
+            AnswerProperties answerProperties, com.portfolio.ragobservability.observability.RagTracing tracing) {
         this.retrievalService = retrievalService;
         this.generationGateway = generationGateway;
         this.contextBuilder = contextBuilder;
         this.promptBuilder = promptBuilder;
         this.citationValidator = citationValidator;
         this.answerProperties = answerProperties;
+        this.tracing = tracing;
     }
 
     public RagResult answer(
             String question,
             Integer requestedTopK,
             Double requestedMinimumSimilarity) {
+        return tracing.trace("rag.answer", () -> answerTraced(question, requestedTopK, requestedMinimumSimilarity));
+    }
+
+    private RagResult answerTraced(String question, Integer requestedTopK, Double requestedMinimumSimilarity) {
+        tracing.tag("rag.generation.called", false);
         String normalizedQuestion = normalizeQuestion(question);
         validateTopK(requestedTopK);
         double minimumSimilarity = resolveMinimumSimilarity(requestedMinimumSimilarity);
@@ -52,6 +67,7 @@ public class RagService {
                 requestedTopK,
                 minimumSimilarity);
         if (retrieval.results().isEmpty()) {
+            tracing.tag("rag.outcome", "no_evidence");
             return result(
                     retrieval,
                     NO_EVIDENCE_ANSWER,
@@ -62,15 +78,30 @@ public class RagService {
         }
 
         try {
-            BuiltContext context = contextBuilder.build(retrieval.results());
-            GenerationResult generated = generationGateway.generate(
-                    promptBuilder.build(normalizedQuestion, context));
-            if (generated == null) {
-                throw new GenerationValidationException("Generation response must not be null");
-            }
-            String answer = citationValidator.validate(
+            record Prepared(BuiltContext context, GenerationPrompt prompt) {}
+            Prepared prepared = tracing.trace("rag.context_build", () -> {
+                BuiltContext built = contextBuilder.build(retrieval.results());
+                tracing.tag("rag.source_count", built.sources().size());
+                return new Prepared(built, promptBuilder.build(normalizedQuestion, built));
+            });
+            BuiltContext context = prepared.context();
+            tracing.tag("rag.generation.called", true);
+            GenerationResult generated = tracing.trace("rag.generation", () -> {
+                tracing.tag("rag.generation.provider", generationGateway.provider());
+                tracing.tag("rag.generation.model", generationGateway.model());
+                GenerationResult result = generationGateway.generate(prepared.prompt());
+                if (result != null) {
+                    tracing.tag("rag.generation.input_tokens", result.inputTokens());
+                    tracing.tag("rag.generation.output_tokens", result.outputTokens());
+                }
+                return result;
+            });
+            String answer = tracing.trace("rag.citation_validation", () -> {
+                if (generated == null) throw new GenerationValidationException("Generation response must not be null");
+                return citationValidator.validate(
                     generated.answer(),
                     context.sources().size());
+            });
             return result(
                     retrieval,
                     answer,

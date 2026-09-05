@@ -1,0 +1,17 @@
+[
+  {"queryId":"DB-001","category":"DIRECT","question":"HikariCP connection timeout이 발생하면 어떤 항목을 확인해야 하나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"active, idle, pending, max"},
+  {"queryId":"DB-002","category":"DIRECT","question":"PostgreSQL에서 장기 트랜잭션과 idle in transaction을 어떻게 점검하나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"장기 트랜잭션과 세션 식별"},
+  {"queryId":"DB-003","category":"PARAPHRASED","question":"트래픽이 몰릴 때 애플리케이션이 데이터 저장소와 대화할 통로를 제때 빌리지 못한다면 어떤 자원과 대기 상태를 조사해야 하나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"연결 획득 대기와 풀 고갈"},
+  {"queryId":"DB-004","category":"PARAPHRASED","question":"저장소로 가는 통로를 무조건 더 많이 열면 요청이 밀리는 현상을 해결할 수 있나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"풀 크기 증가와 DB 자원 예산"},
+  {"queryId":"CPU-001","category":"DIRECT","question":"컨테이너 CPU 제한 때문에 처리량이 떨어질 때 무엇을 확인해야 하나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"CPU limit과 CFS throttling"},
+  {"queryId":"CPU-002","category":"DIRECT","question":"CPU 사용률이 높을 때 thread dump와 GC 지표로 원인을 어떻게 구분하나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"반복 dump와 GC 관찰"},
+  {"queryId":"CPU-003","category":"PARAPHRASED","question":"프로그램이 같은 계산을 끝없이 반복하는지 알아내려면 실행 중인 작업의 어떤 모습을 여러 번 비교해야 하나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"여러 스레드 덤프에서 반복되는 스택"},
+  {"queryId":"CPU-004","category":"PARAPHRASED","question":"컨테이너에 할당된 연산 시간이 자꾸 끊겨 응답이 느려지는 상황은 어떤 수치를 함께 보면 구분할 수 있나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"사용량, 제한량, throttled time, 요청 지연"},
+  {"queryId":"DEPLOY-001","category":"DIRECT","question":"배포 후 readiness probe가 실패하면 어떤 로그와 의존성을 확인해야 하나요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"readiness와 시작 로그"},
+  {"queryId":"DEPLOY-002","category":"DIRECT","question":"Flyway 마이그레이션이 포함된 배포에서 canary rollback 전에 무엇을 확인해야 하나요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"스키마와 이전 버전 호환성"},
+  {"queryId":"DEPLOY-003","category":"PARAPHRASED","question":"새 버전을 일부 사용자에게만 열었는데 오류가 늘었다면 이전 버전으로 되돌릴지 어떤 근거로 결정하나요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"카나리 오류율과 복구 판단"},
+  {"queryId":"DEPLOY-004","category":"PARAPHRASED","question":"업데이트하면서 저장 구조도 바꿨는데 프로그램만 예전 것으로 돌려도 안전한가요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"이전 애플리케이션과 변경된 스키마 호환성"},
+  {"queryId":"NONE-001","category":"UNRELATED","question":"연차 신청은 누구에게 승인받아야 하나요?","relevantDocument":null,"relevantChunkHint":null},
+  {"queryId":"NONE-002","category":"UNRELATED","question":"회사 출장 숙박비는 얼마까지 지원되나요?","relevantDocument":null,"relevantChunkHint":null},
+  {"queryId":"NONE-003","category":"UNRELATED","question":"점심 식대 영수증은 어디에 제출하나요?","relevantDocument":null,"relevantChunkHint":null}
+]

@@ -1,0 +1,29 @@
+{
+  "formatVersion": 2,
+  "datasetId": "retrieval-validation-v1",
+  "documents": {
+    "db-connection-timeout.md": "44b2d1cc8fc82bb7115d1091f1ce6dead98158bd0d9a5a33740d40893d96c925",
+    "cpu-spike.md": "d6afff35a4cbcc4fe7d3625665c01f84544efe0e9ff899c28dbc1a5374524ef8",
+    "deployment-rollback.md": "2012e66dadfdd0dc75de74d3779ff1d2847bf264a48d34f5fe676e4d4fce5017"
+  },
+  "queries": [
+    {"queryId":"V-DB-01","category":"DIRECT","question":"HikariCP leak detection 임계값을 지나치게 낮게 설정하면 어떤 문제가 생기나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"장기 실행 쿼리와 누수 조사","judgmentReason":"정상 장기 요청도 누수처럼 보일 수 있으며 실제 SLA보다 충분히 크게 설정하도록 설명한다."},
+    {"queryId":"V-DB-02","category":"DIRECT","question":"연결 timeout 뒤 재시도를 허용하려면 backoff·jitter·멱등성을 어떻게 고려해야 하나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"안전한 완화 순서","judgmentReason":"제한된 횟수, 지수 backoff, jitter, 멱등성이 보장된 작업을 설명한다."},
+    {"queryId":"V-DB-03","category":"PARAPHRASED","question":"데이터베이스 연결 오류가 잠시 사라졌다고 바로 복구 완료로 봐도 되나요? 얼마나 더 지켜봐야 하나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"복구 확인과 사후 조치","judgmentReason":"대기자·유휴 연결·지연 회복을 확인하고 최소 15분 관찰한다."},
+    {"queryId":"V-DB-04","category":"PARAPHRASED","question":"장애를 넘기려고 잠깐 늘린 연결 설정은 문제가 진정된 뒤 어떻게 관리해야 하나요?","relevantDocument":"db-connection-timeout.md","relevantChunkHint":"안전한 완화 순서","judgmentReason":"임시 설정을 영구값으로 남기지 말고 원래 값과 변경 시각을 기록한다."},
+    {"queryId":"V-CPU-01","category":"DIRECT","question":"전체 RPS가 비슷한데 CPU가 상승하면 payload와 요청 구성에서 무엇을 확인해야 하나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"트래픽과 런타임 확인","judgmentReason":"대용량 payload와 비싼 검색 요청 비율 증가를 확인한다."},
+    {"queryId":"V-CPU-02","category":"DIRECT","question":"Thread dump 파일은 왜 접근이 제한된 위치에 보관해야 하나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"Thread dump와 프로파일링","judgmentReason":"stack이나 로컬 변수에 민감한 요청 데이터가 포함될 수 있다."},
+    {"queryId":"V-CPU-03","category":"PARAPHRASED","question":"같은 서비스를 띄운 여러 실행 단위 중 하나만 과열된다면, 전부 과열될 때와 조사 방향이 어떻게 달라지나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"현상 분류","judgmentReason":"단일 pod의 로컬 상태·스레드·노드 경합과 전체 트래픽·공통 배포 등을 구분한다."},
+    {"queryId":"V-CPU-04","category":"PARAPHRASED","question":"처리 장치를 여러 개 더 띄워 장애를 넘겼다면, 다시 수를 줄이기 전에 무엇을 판단해야 하나요?","relevantDocument":"cpu-spike.md","relevantChunkHint":"복구 확인과 사후 조치","judgmentReason":"scale-in 후 동일 부하를 감당할지 또는 새 기준 용량을 유지할지 판단한다."},
+    {"queryId":"V-DEP-01","category":"DIRECT","question":"Flyway checksum 불일치를 해결하려고 이미 적용된 migration 파일을 수정해도 되나요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"Flyway와 DB 호환성","judgmentReason":"기존 파일을 수정하지 않고 새 버전 migration으로 변경을 추가한다."},
+    {"queryId":"V-DEP-02","category":"DIRECT","question":"같은 image tag인데 실행 코드가 달라 보이면 어떤 배포 식별 정보를 비교해야 하나요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"설정과 Secret 확인","judgmentReason":"image digest·Git commit·build timestamp를 확인한다."},
+    {"queryId":"V-DEP-03","category":"PARAPHRASED","question":"설정 보관소의 값을 바꿨는데 이미 떠 있는 프로그램도 저절로 새 값을 읽었다고 봐도 되나요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"설정과 Secret 확인","judgmentReason":"ConfigMap·Secret 갱신이 자동 반영된다고 가정하지 말고 필요 시 명시적 rollout을 수행한다."},
+    {"queryId":"V-DEP-04","category":"PARAPHRASED","question":"이전 버전으로 되돌리는 동안 배포 시스템이 문제 버전을 다시 올리지 않게 무엇을 확인해야 하나요?","relevantDocument":"deployment-rollback.md","relevantChunkHint":"Rollback 실행","judgmentReason":"배포 자동화의 일시 중지 상태를 확인한다."},
+    {"queryId":"V-HARD-01","category":"HARD_NEGATIVE","question":"우리 서비스의 HikariCP leakDetectionThreshold를 정확히 몇 밀리초로 설정해야 하나요?","relevantDocument":null,"relevantChunkHint":null,"judgmentReason":"SLA를 고려하라는 지침만 있고 해당 서비스의 정확한 수치는 없다."},
+    {"queryId":"V-HARD-02","category":"HARD_NEGATIVE","question":"운영 환경에서 async-profiler를 실행할 정확한 셸 명령과 옵션을 알려주세요.","relevantDocument":null,"relevantChunkHint":null,"judgmentReason":"도구와 수집 제한은 언급하지만 실행 명령·옵션은 없다."},
+    {"queryId":"V-HARD-03","category":"HARD_NEGATIVE","question":"우리 canary 배포의 중단 기준인 5xx 오류율은 정확히 몇 퍼센트인가요?","relevantDocument":null,"relevantChunkHint":null,"judgmentReason":"사전 정의한 한도를 따르지만 구체적인 수치는 없다."},
+    {"queryId":"V-NONE-01","category":"UNRELATED","question":"식빵 반죽의 1차 발효가 끝났는지는 어떻게 확인하나요?","relevantDocument":null,"relevantChunkHint":null,"judgmentReason":"문서 3개에 제빵 내용이 없다."},
+    {"queryId":"V-NONE-02","category":"UNRELATED","question":"달의 위상이 매일 조금씩 달라지는 이유는 무엇인가요?","relevantDocument":null,"relevantChunkHint":null,"judgmentReason":"문서 3개에 천문 내용이 없다."},
+    {"queryId":"V-NONE-03","category":"UNRELATED","question":"실내 화분의 분갈이 시기를 판단하는 기준은 무엇인가요?","relevantDocument":null,"relevantChunkHint":null,"judgmentReason":"문서 3개에 원예 내용이 없다."}
+  ]
+}

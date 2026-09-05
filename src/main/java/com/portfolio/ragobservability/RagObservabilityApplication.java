@@ -7,7 +7,15 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 public class RagObservabilityApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(RagObservabilityApplication.class, args);
+        var context = SpringApplication.run(RagObservabilityApplication.class, args);
+        if (context.getEnvironment().matchesProfiles("evaluation")) {
+            int code;
+            try {
+                code = com.portfolio.ragobservability.evaluation.EvaluationCli.execute(context);
+            } finally {
+                context.close();
+            }
+            System.exit(code);
+        }
     }
 }
-

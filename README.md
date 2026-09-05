@@ -1,5 +1,7 @@
 # RAG Observability
 
+Top-K 1/2/3/5의 무료 오프라인 비교는 [Top-K 실습 안내](docs/topk-validation.md)를 참고하세요. 실험 threshold는 0.3이며 운영 기본값은 변경하지 않습니다.
+
 운영 문서를 Chunk와 Embedding으로 변환해 PostgreSQL/pgvector에 저장하고, 근거가 포함된 RAG 답변을 반환하며, 처리 흐름을 OpenTelemetry Trace로 검증하는 Spring Boot 포트폴리오 프로젝트입니다.
 
 ## 고정한 개발 환경
@@ -295,5 +297,82 @@ API 키, 원문 질문, Chunk 전문과 Prompt 전문은 로그나 Trace attribu
 - 생성 connect/read timeout, 단일 호출 정책과 token 사용량 반환
 - `/api/v1/answers`의 Testcontainers 기반 전체 파이프라인 통합 테스트
 
-다음 구현 순서는 Golden query 평가 → Custom Span → Chunk Size × Top-K 실험입니다.
+Golden Query baseline 측정과 검색·RAG Custom Span 다음 순서는 threshold 및 Chunk Size × Top-K 실험입니다.
 
+## 검색·RAG Custom Span (7장)
+
+`/api/v1/search`와 `/api/v1/answers` 응답의 `X-Trace-Id`로 Grafana Tempo에서 요청을 찾을 수 있습니다. 검색의 Query Embedding·DB 검색, 답변의 Context 조립·Generation·인용 검증 시간이 각각 기록됩니다. 근거 부족은 `rag.outcome=no_evidence`로 표시되며 Generation Span을 만들지 않습니다.
+
+실행 요청은 `http/observability-lab.http`, Grafana 조회 방법과 무료 Fake 검증 명령은 [관측성 실습](docs/observability-lab.md)에 있습니다. tracing 비활성화 시 헤더와 Custom Span은 생략하며 Golden Query 평가 프로필은 계속 tracing을 끕니다. 질문·Prompt·원문·벡터·키·원래 예외 내용은 Span에 기록하지 않습니다.
+
+## Golden Query baseline (6장)
+
+검색 품질을 문서 수준으로 채점합니다. LLM 답변 품질 평가는 아닙니다.
+
+1. `evaluation/retrieval-golden-set.json`: 정답 파일명으로 고정한 15개 질문입니다. 문서마다 DIRECT 2개·PARAPHRASED 2개, UNRELATED 3개입니다. 힌트는 사람의 검토용이며 자동 채점에 사용하지 않습니다.
+2. `EvaluationMetrics`: Top-5 **Chunk 순위**를 유지하여 Hit@5와 MRR@5를 계산합니다. 같은 문서의 Chunk를 중복 제거하지 않습니다. 관련 없는 질문은 분모에서 제외합니다.
+3. `EvaluationCorpus` → `EvaluationRunner`: 기존 DB를 사전 검사한 후 `RetrievalService.search()`를 순차 호출합니다. 외부 호출을 감싸는 DB 트랜잭션은 없습니다.
+4. `EvaluationReport`: 실행별 고유 디렉터리에 결과와 재현 조건을 보관합니다. 중간 실패는 이후 호출을 중단하고 `INCOMPLETE`로 기록하며 최종 Hit/MRR은 발표하지 않습니다.
+
+### 실행
+
+Docker PostgreSQL을 실행하고 기존 lab의 세 문서가 Chunking/Embedding 모두 READY인지 확인합니다. `.env`에 활성 Embedding provider와 유효한 API Key가 필요합니다. 키를 명령행에 입력하지 마세요.
+
+```powershell
+# 사용법만 표시: API 호출 없음
+.\scripts\run-evaluation.ps1
+
+# 유료 Query Embedding 호출에 명시적으로 동의할 때 실행
+.\scripts\run-evaluation.ps1 -Live
+```
+
+Spring 서버는 따로 실행하지 않아도 됩니다. 전용 non-web `evaluation` 프로필이 Generation, Flyway, tracing을 끄고 실행 후 종료합니다. 정상 완료는 종료 코드 0, 사전 검사·검색·출력 실패는 비정상 종료입니다. 일반 부팅과 `mvn clean test`는 평가를 자동 실행하지 않습니다.
+
+- 조건: Top-K=5, minimum similarity=-1.0, 기존 cosine exact search.
+- 기존 600-token Chunk를 재사용합니다. **600이라는 생성 설정은 DB에 저장되어 있지 않으므로 운영자 확인 사항**이며, 보고서에 이 전제를 명시합니다. Chunk 수는 실제 DB에서 기록하며 13개로 강제하지 않습니다.
+- 세 파일명이 각각 유일하고 모든 Chunk가 현재 provider/model의 1536차원 벡터를 가져야 합니다. 추가 적격 문서가 있으면 baseline 오염을 막기 위해 중단합니다. 실행 중 업로드·삭제·재처리를 하지 마세요.
+- 정상 실행은 논리 검색 호출 15회입니다. 재임베딩·LLM·워밍업·자동 재시도는 없습니다.
+
+### 결과 읽기
+
+`evaluation/results/<timestamp>-<runId>/`에 `queries.csv`, `hits.csv`, `summary.md`가 생성됩니다. Git commit/dirty, 데이터셋 SHA-256, 문서 ID·원문 해시·Chunk 수, 모델과 검색 조건을 함께 남깁니다. 결과 디렉터리는 Git에서 제외됩니다. 포트폴리오에 게시할 결과는 검토한 뒤 별도로 보관하세요.
+
+- **Hit@5**: 관련 질문 12개 중 정답 문서의 Chunk가 Top-5에 한 번이라도 등장한 비율.
+- **MRR@5**: 첫 정답 Chunk의 순위가 1위면 1, 3위면 1/3, 없으면 0인 점수의 평균.
+- **p50/p95**: 성공 요청의 Query Embedding + DB 검색 시간에 nearest-rank 적용. HTTP·LLM·파일 출력은 제외하며, 작은 표본의 탐색적 측정이지 부하 테스트가 아닙니다.
+- `REVIEW_RANK`/`MISS` 행은 원문과 `relevantChunkHint`를 참고하여 검토합니다. 문서가 맞아도 해당 Chunk에 충분한 근거가 있다는 보장은 없습니다.
+- UNRELATED는 Hit/RR을 비워 두고 최고 similarity와 결과 수를 관찰합니다. threshold=-1에서는 빈 결과를 기대하지 않습니다.
+- 낮은 점수도 그대로 baseline으로 보관합니다. 질문/정답을 변경할 때는 원본을 보존하고 새 데이터셋 버전으로 기록하세요. 해시는 변경 식별에 사용됩니다.
+
+사전 검사 실패 코드: `EMBEDDING_DISABLED`(설정), `CORPUS_MISSING_OR_DUPLICATE_FILENAME`(파일명), `CORPUS_NOT_READY_OR_MODEL_MISMATCH`(상태·Chunk·벡터), `EXTRA_ELIGIBLE_DOCUMENTS`(추가 검색 대상). 원문·벡터·키·provider 내부 오류는 보고서에 기록하지 않습니다.
+
+자동 테스트는 Fake Gateway와 별도 Testcontainers DB로 검증합니다. 실제 baseline 완료는 사용자가 `-Live`로 15개 결과를 생성한 뒤 판정합니다. threshold 비교·LLM 평가·Custom Span·Frontend 및 RAG Prompt Injection 수동 검증은 이번 범위에 포함되지 않습니다.
+
+## 저장된 Baseline Threshold 비교 (8-1장)
+
+```powershell
+.\scripts\compare-thresholds.ps1 -BaselineDir "evaluation/results/<기존 실행 디렉터리>"
+```
+
+Spring·Docker·DB·API Key 없이 Java 21로 저장된 결과만 분석합니다. 최초 Maven 의존성 준비에는 인터넷이 필요할 수 있지만 OpenAI 호출은 없습니다. 경로는 명령을 실행한 위치 기준이며 필수입니다. `.env`를 읽거나 현재 RAG threshold를 변경하지 않습니다.
+
+입력은 `summary.md`, `queries.csv`, `hits.csv`입니다. COMPLETE·Top-K=5·threshold=-1.0·관련 12개/무관 3개의 정상 baseline만 받습니다. 손상된 CSV, 누락 메타데이터, 중복 ID, 비정상 순위·점수·결과 수는 실행 전에 거부합니다. 정답 파일명은 입력 실행 기록에서 가져옵니다.
+
+threshold `-1.0 / 0.3 / 0.4 / 0.5 / 0.7`에서 Hit@5·MRR@5·관련 질문 빈 결과율·무관 질문 결과 반환율·평균 Chunk 수를 비교합니다. 같은 문서의 여러 Chunk도 순위에 그대로 남습니다. 기준 점수와 같으면 포함합니다.
+
+출력은 `evaluation/results/threshold-comparison-<timestamp>-<runId>/`에 보관합니다.
+
+- `comparison.csv`: 조건별 지표와 분모
+- `query-comparison.csv`: 15개 질문 × 5개 조건, 정답 누락과 빈 결과 구분
+- `summary.md`: 비교표·탈락 질문·입력 파일 해시·원래 실행 조건·비교 도구 Git 상태
+
+정상 종료 코드는 0, 입력·출력 실패는 비정상 종료입니다. 성공 summary는 모든 결과를 쓴 뒤 생성합니다. 원본과 이전 실행 결과는 덮어쓰지 않습니다. 보고서 디렉터리는 기존처럼 Git에서 제외합니다.
+
+현재 저장된 baseline 재분석 결과: threshold 0.3에서는 Hit@5=1.0, MRR@5=0.875를 유지하며 무관 질문 3개가 모두 빈 결과입니다. 0.4는 Hit@5=0.75, 0.5는 0.5, 0.7은 약 0.0833입니다. 0.4에서 DEPLOY-004는 다른 문서가 남지만 정답은 사라집니다. 결과가 비지 않았다는 사실만으로 검색 성공으로 판정하지 않습니다.
+
+이는 기존 Top-5의 더 높은 threshold에 대한 재분석입니다. Top-K를 늘리거나 새로운 순위·지연시간을 측정하지 않습니다. 후보를 선택한 뒤 새로운 질문으로 검증해야 하며 자동으로 최적값을 확정하지 않습니다.
+
+관련 테스트: `ThresholdComparisonTests` (개발 DB와 실제 baseline 파일에 의존하지 않는 생성 fixture 사용).
+# 새 질문으로 Threshold 후보 검증
+
+18개 고정 질문의 무료 사전 검증, 별도 유료 평가(Embedding 18회), 저장 결과 재채점 절차는 [threshold 검증 안내](docs/threshold-validation.md)를 참고하세요. 기존 15개 baseline과 RAG threshold 0.5는 유지합니다.

@@ -8,9 +8,9 @@
 # 5. 각 단계의 관찰값은 docs/retrieval-lab-results.md에 기록한다.
 
 @baseUrl = http://localhost:8080
-@dbDocumentId = 0
-@cpuDocumentId = 0
-@deployDocumentId = 0
+@dbDocumentId = 1
+@cpuDocumentId = 2
+@deployDocumentId = 3
 
 ### 1-1. 애플리케이션과 DB health 확인
 # @name health

@@ -50,12 +50,12 @@ PowerShell에서 인프라 상태를 확인하고 애플리케이션을 실행�
 `run-app.ps1`을 실행한 터미널은 그대로 둔다. IntelliJ에서 `http/retrieval-lab.http`를 열고 `1-1. 애플리케이션과 DB health 확인` 요청의 ▶ 버튼을 누른다.
 
 | 확인 항목 | 기대값 | 관찰값 |
-|---|---|---|
-| HTTP status | 200 |  |
-| 전체 health | UP |  |
-| DB component | UP |  |
-| Flyway | V3 validation 성공 |  |
-| 로그의 API Key 값 | 노출 없음 |  |
+|---|---|--------|
+| HTTP status | 200 | 200    |
+| 전체 health | UP | UP     |
+| DB component | UP | UP     |
+| Flyway | V3 validation 성공 | O      |
+| 로그의 API Key 값 | 노출 없음 | O      |
 
 이 단계가 실패하면 Upload로 넘어가지 않는다. 애플리케이션 로그에는 키 자체를 적지 말고 오류 코드와 요약만 기록한다.
 
@@ -64,10 +64,10 @@ PowerShell에서 인프라 상태를 확인하고 애플리케이션을 실행�
 HTTP 파일에서 세 Upload 요청을 차례대로 실행한다. 성공한 응답의 `id`는 response handler가 현재 IntelliJ 세션의 `dbDocumentId`, `cpuDocumentId`, `deployDocumentId`에 저장한다. IntelliJ를 재시작하면 저장값이 사라지므로 같은 세션에서 계속하거나 목록 API에서 ID를 찾아 HTTP 파일 상단의 `0`을 수정한다.
 
 | 문서 | documentId | HTTP | status | embeddingStatus | sourceType |
-|---|---:|---:|---|---|---|
-| DB Connection Timeout |  | 201 | PENDING | NOT_STARTED | MARKDOWN |
-| CPU Spike |  | 201 | PENDING | NOT_STARTED | MARKDOWN |
-| Deployment Rollback |  | 201 | PENDING | NOT_STARTED | MARKDOWN |
+|---|-----------:|---:|---|---|---|
+| DB Connection Timeout |          1 | 201 | PENDING | NOT_STARTED | MARKDOWN |
+| CPU Spike |          2 | 201 | PENDING | NOT_STARTED | MARKDOWN |
+| Deployment Rollback |          3 | 201 | PENDING | NOT_STARTED | MARKDOWN |
 
 관찰 포인트:
 
@@ -81,11 +81,11 @@ HTTP 파일에서 세 Upload 요청을 차례대로 실행한다. 성공한 응�
 
 작성 시점에 프로젝트의 실제 `TokenTextSplitter`와 `JTokkitTokenCountEstimator`로 수행한 오프라인 사전 검증에서는 DB 문서 5개, CPU 문서 4개, 배포 문서 4개 Chunk가 생성됐다. 수동 실행 결과도 이 값과 같은지 비교하되, 라이브러리나 설정을 변경했다면 실제 API 응답을 기준으로 기록한다.
 
-| 문서 | chunkCount | Chunk별 tokenCount | index가 0부터 연속인가 | status | embeddingStatus |
-|---|---:|---|---|---|---|
-| DB Connection Timeout |  |  |  | READY | PENDING |
-| CPU Spike |  |  |  | READY | PENDING |
-| Deployment Rollback |  |  |  | READY | PENDING |
+| 문서 | chunkCount | Chunk별 tokenCount                  | index가 0부터 연속인가 | status | embeddingStatus |
+|---|-----------:|-------------------------------------|------------------------|---|---|
+| DB Connection Timeout |          5 | 554<br/>568<br/>548<br/>591<br/>161 | Y                      | READY | PENDING |
+| CPU Spike |          4 | 595<br/>566<br/>596<br/>356         | Y                      | READY | PENDING |
+| Deployment Rollback |          4 | 574<br/>572<br/>571<br/>414           | Y                      | READY | PENDING |
 
 관찰 포인트:
 
@@ -99,10 +99,10 @@ HTTP 파일에서 세 Upload 요청을 차례대로 실행한다. 성공한 응�
 세 Embedding 요청은 실제 OpenAI API를 호출한다. 한 요청이 성공했는지 확인한 뒤 다음 문서로 이동한다. 인증 실패, timeout 또는 잘못된 차원 오류가 나면 Retrieval을 실행하지 않는다.
 
 | 문서 | totalChunkCount | embeddedChunkCount | provider | model | dimensions | 결과/오류 |
-|---|---:|---:|---|---|---:|---|
-| DB Connection Timeout |  |  | openai | text-embedding-3-small | 1536 |  |
-| CPU Spike |  |  | openai | text-embedding-3-small | 1536 |  |
-| Deployment Rollback |  |  | openai | text-embedding-3-small | 1536 |  |
+|---|----------------:|-------------------:|---|---|---:|---|
+| DB Connection Timeout |               5 |                  5 | openai | text-embedding-3-small | 1536 |  |
+| CPU Spike |               4 |                  4 | openai | text-embedding-3-small | 1536 |  |
+| Deployment Rollback |               4 |                  4 | openai | text-embedding-3-small | 1536 |  |
 
 관찰 포인트:
 
@@ -140,54 +140,54 @@ ORDER BY d.id;
 
 ### 질문별 판정표
 
-| 질문 유형 | threshold | 1위 문서/Chunk | 1위 similarity | 기대 결과 | 관찰 결과 |
-|---|---:|---|---:|---|---|
-| 직접 DB 질문 | -1.0 |  |  | DB 문서 Top-1 |  |
-| 어려운 표현 | -1.0 |  |  | DB 문서 Top-3 |  |
-| CPU 질문 | -1.0 |  |  | CPU 문서 Top-1 |  |
-| 관련 없음 | -1.0 |  |  | 점수 분포 관찰 |  |
-| 관련 없음 | 0.0 |  |  | -1.0보다 결과가 늘지 않음 |  |
-| 관련 없음 | 0.5 |  |  | 0.0보다 결과가 늘지 않음 |  |
-| 관련 없음 | 0.7 |  |  | 결과 감소 또는 빈 결과 가능 |  |
+| 질문 유형 | threshold | 1위 문서/Chunk           | 1위 similarity | 기대 결과 | 관찰 결과       |
+|---|---:|--------------------------|---------------:|---|-----------------|
+| 직접 DB 질문 | -1.0 | DB connection / 1        |          0.579 | DB 문서 Top-1 | 예상결과와 동일 |
+| 어려운 표현 | -1.0 | cpu Spike / 8            |          0.462 | DB 문서 Top-3 | 예상결과와 동일 |
+| CPU 질문 | -1.0 | cpu Spike / 6            |          0.582 | CPU 문서 Top-1 | 에상결과와 동일 |
+| 관련 없음 | -1.0 | Deployment Rollback / 13 |          0.176 | 점수 분포 관찰 | 낮은 similarity |
+| 관련 없음 | 0.0 | Deployment Rollback / 13 |          0.176 | -1.0보다 결과가 늘지 않음 | -1.0와 동일     |
+| 관련 없음 | 0.5 | X                        |              X | 0.0보다 결과가 늘지 않음 | resultCount = 0 |
+| 관련 없음 | 0.7 | X                        |              X | 결과 감소 또는 빈 결과 가능 | resultCount = 0 |
 
 ### 직접 DB 질문 Top-5
 
-| 순위 | documentId | 문서 제목 | chunkIndex | similarity | 매칭된 내용 요약 |
-|---:|---:|---|---:|---:|---|
-| 1 |  |  |  |  |  |
-| 2 |  |  |  |  |  |
-| 3 |  |  |  |  |  |
-| 4 |  |  |  |  |  |
-| 5 |  |  |  |  |  |
+| 순위 | documentId | 문서 제목                        | chunkIndex | similarity | 매칭된 내용 요약 |
+|---:|-----------:|----------------------------------|-----------:|-----------:|---|
+| 1 |          1 | DB Connection                    |          0 |      0.579 | 첫 번째로 HikariCP의 `active`, `idle`, `pending`, `max` 지표를 확인한다. |
+| 2 |          1 | DB Connection                    |          3 |      0.557 | 명확한 blocking transaction이 있고 종료 영향이 확인됐을 때만 해당 세션 취소 또는 종료를 선택한다. |
+| 3 |          1 | DB Connection                    |          2 |      0.460 | 단순히 세션을 종료하기 전에 어떤 애플리케이션, 사용자, 쿼리와 요청에서 만들어졌는지 식별하고 영향 범위를 기록한다. |
+| 4 |          1 | DB Connection                    |          4 |      0.452 | 재발 방지를 위해 풀 대기자 수, connection acquisition latency, `idle in transaction` 지속 시간에 경보를 둔다. |
+| 5 |          3 | Deployment Rollback              |          1 |      0.402 | probe 실패 이유와 애플리케이션 시작 로그를 함께 확인해 단순 시간 부족인지 실제 의존성 실패인지 분류한다 |
 
 ### 어려운 표현 질문 Top-5
 
-| 순위 | documentId | 문서 제목 | chunkIndex | similarity | 매칭된 내용 요약 |
-|---:|---:|---|---:|---:|---|
-| 1 |  |  |  |  |  |
-| 2 |  |  |  |  |  |
-| 3 |  |  |  |  |  |
-| 4 |  |  |  |  |  |
-| 5 |  |  |  |  |  |
+| 순위 | documentId | 문서 제목           | chunkIndex | similarity | 매칭된 내용 요약 |
+|---:|-----------:|---------------------|-----------:|-----------:|---|
+| 1 |          2 | cpu Spike           |          2 |      0.462 | 여러 dump에서 JSON 직렬화, 정규식, 압축, 암호화 또는 특정 반복문이 계속 상단에 보이는지 확인한다. lock을 기다리는 BLOCKED 스레드가 많다면 CPU 문제처럼 보이지만 실제 병목은 동기화 경합일 수 있다. |
+| 2 |          1 | DB connection       |          2 |      0.438 | 단순히 세션을 종료하기 전에 어떤 애플리케이션, 사용자, 쿼리와 요청에서 만들어졌는지 식별하고 영향 범위를 기록한다 |
+| 3 |          3 | Deployment Rollback |          1 |      0.416 | probe 실패 이유와 애플리케이션 시작 로그를 함께 확인해 단순 시간 부족인지 실제 의존성 실패인지 분류한다. |
+| 4 |          2 | cpu Spike           |          1 |      0.404 | 단순히 JVM 프로세스의 CPU 백분율만 보면 이 차이를 놓칠 수 있으므로 Kubernetes request와 limit, 노드의 실제 여유까지 함께 본다. |
+| 5 |          1 | DB connection       |          1 |      0.400 |작스러운 트래픽 증가 없이 배포 직후 문제가 시작됐다면 커넥션을 닫지 않는 코드, 트랜잭션 범위 확대, 새로 추가한 느린 쿼리를 우선 의심한다.  |
 
 ### CPU 질문 Top-5
 
-| 순위 | documentId | 문서 제목 | chunkIndex | similarity | 매칭된 내용 요약 |
-|---:|---:|---|---:|---:|---|
-| 1 |  |  |  |  |  |
-| 2 |  |  |  |  |  |
-| 3 |  |  |  |  |  |
-| 4 |  |  |  |  |  |
-| 5 |  |  |  |  |  |
+| 순위 | documentId | 문서 제목     | chunkIndex | similarity | 매칭된 내용 요약                                                                                                                                     |
+|---:|-----------:|---------------|-----------:|-----------:|------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 |          2 | cpu Spike     |          0 |      0.582 | 컨테이너가 CPU limit에 막혀 throttling 되는 경우, JVM의 GC가 반복되는 경우, 특정 스레드가 무한 반복하는 경우와 정상적인 트래픽 증가를 구분해야 한다. |
+| 2 |          2 | cpu Spike     |          3 |      0.488 | GC pause와 allocation rate, runnable thread 수가 안정화됐는지 확인한다.                                                                              |
+| 3 |          2 | cpu Spike     |          1 |      0.485 |오류를 만난 클라이언트가 빠르게 재시도하는지도 확인한다. 재시도 폭풍은 동일 작업을 여러 번 실행해 CPU를 소모하고 downstream에 추가 부하를 전달하므로 rate limit과 backoff 상태를 점검한다.                                                                                                                                                      |
+| 4 |          1 | DB connection |          3 |      0.416 |명확한 blocking transaction이 있고 종료 영향이 확인됐을 때만 해당 세션 취소 또는 종료를 선택한다. |
+| 5 |          2 | cpu Spike     |          2 |      0.411 |짧은 프로파일링이 허용되면 Java Flight Recorder나 async-profiler로 CPU sample을 수집하되 운영 부하와 수집 시간을 제한한다                                                                                                                                                                                                                                                                                                           |
 
 ### 관련 없는 질문의 threshold 변화
 
-| threshold | resultCount | 최고 similarity | 최저 similarity | 관찰 |
-|---:|---:|---:|---:|---|
-| -1.0 |  |  |  |  |
-| 0.0 |  |  |  |  |
-| 0.5 |  |  |  |  |
-| 0.7 |  |  |  |  |
+| threshold | resultCount | 최고 similarity | 최저 similarity | 관찰                 |
+|---:|------------:|----------------:|----------------:|----------------------|
+| -1.0 |           5 |           0.176 |           0.128 | 관련없는 내용들 제시 |
+| 0.0 |           5 |           0.176 |           0.128 | -1.0와 동일          |
+| 0.5 |           0 |               x |               x | 답변 안나옴          |
+| 0.7 |           0 |               x |               x |답변 안나옴
 
 관련 없는 질문에도 낮은 threshold에서는 결과가 나올 수 있다. Vector Search는 “정답이 있다”를 판단하는 기능이 아니라 현재 후보 가운데 상대적으로 가까운 것을 정렬하는 기능이기 때문이다. threshold를 높이면 조건을 통과하지 못한 후보가 제거되므로 결과 수는 같거나 줄어야 한다.
 
@@ -196,13 +196,13 @@ ORDER BY d.id;
 이 HTTP 파일의 필수 흐름은 문서 Embedding 3회와 Query Embedding 7회다. 각 문서가 32개 이하의 Chunk라면 현재 batch 크기에서 문서당 외부 Embedding 요청은 보통 1회이므로 예상 외부 호출은 총 10회다. Chunk가 32개를 넘거나 요청을 재실행하면 실제 호출 수는 늘어난다.
 
 | 시각 | 작업 | 논리 호출 수 | 성공/실패 | HTTP/code | 비민감 오류 요약 |
-|---|---|---:|---|---|---|
-|  | 문서 Embedding 3건 | 3 |  |  |  |
-|  | 직접 DB 질문 | 1 |  |  |  |
-|  | 어려운 표현 질문 | 1 |  |  |  |
-|  | CPU 질문 | 1 |  |  |  |
-|  | 관련 없음, threshold 4종 | 4 |  |  |  |
-| **합계** |  | **10** |  |  |  |
+|---|---|---:|-----------|-----------|---|
+|  | 문서 Embedding 3건 | 3 | 3/0       | 200       |  |
+|  | 직접 DB 질문 | 1 | 1/0       | 200       |  |
+|  | 어려운 표현 질문 | 1 | 1/0       | 200       |  |
+|  | CPU 질문 | 1 | 1/0       | 200       |  |
+|  | 관련 없음, threshold 4종 | 4 | 4/0       | 200       |  |
+| **합계** |  | **10** | 10/0      | 200       |  |
 
 API Key, query vector, Chunk 전문 또는 SQL vector literal은 오류 기록에 넣지 않는다.
 

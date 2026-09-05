@@ -1,0 +1,14 @@
+spring:
+    main:
+        web-application-type: none
+    flyway:
+        enabled: false
+    ai:
+        model:
+            chat: none
+rag:
+    generation:
+        provider: none
+management:
+    tracing:
+        enabled: false
