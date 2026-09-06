@@ -181,12 +181,19 @@ class TracingHttpTests {
     }
     @TestConfiguration(proxyBeanMethods=false)
     static class Config {
-        @Bean SpanExporter spanExporter() {
-            if (Boolean.getBoolean("observability.live")) return SpanExporter.composite(MEMORY,
-                    OtlpHttpSpanExporter.builder().setEndpoint("http://localhost:4318/v1/traces").build());
+        @Bean SpanExporter inMemorySpanExporter() {
+            return MEMORY;
+        }
+        @Bean OtlpHttpSpanExporter otlpHttpSpanExporter() {
+            // The concrete bean makes Boot's OTLP auto-configuration back off, so this
+            // exporter and the in-memory exporter are each registered exactly once.
+            var builder = OtlpHttpSpanExporter.builder();
+            if (Boolean.getBoolean("observability.live")) {
+                return builder.setEndpoint("http://localhost:4318/v1/traces").build();
+            }
             // Intentionally unreachable collector: requests must still succeed.
-            return SpanExporter.composite(MEMORY, OtlpHttpSpanExporter.builder()
-                    .setEndpoint("http://127.0.0.1:1/v1/traces").setTimeout(java.time.Duration.ofMillis(100)).build());
+            return builder.setEndpoint("http://127.0.0.1:1/v1/traces")
+                    .setTimeout(java.time.Duration.ofMillis(100)).build();
         }
     }
 }

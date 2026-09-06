@@ -1,378 +1,546 @@
 # RAG Observability
 
-Top-K 1/2/3/5의 무료 오프라인 비교는 [Top-K 실습 안내](docs/topk-validation.md)를 참고하세요. 실험 threshold는 0.3이며 운영 기본값은 변경하지 않습니다.
+운영 장애 대응 문서(TXT/Markdown)를 검색 가능한 지식으로 변환하고, 질문에 맞는 근거를 찾아 답변하며, 그 전 과정을 하나의 Trace ID로 추적하는 RAG 백엔드입니다.
 
-운영 문서를 Chunk와 Embedding으로 변환해 PostgreSQL/pgvector에 저장하고, 근거가 포함된 RAG 답변을 반환하며, 처리 흐름을 OpenTelemetry Trace로 검증하는 Spring Boot 포트폴리오 프로젝트입니다.
+OpenAI는 Embedding·Chat model inference에 사용합니다. 그 전후의 문서 상태 전이, batch와 Vector 검증, pgvector 검색 SQL, 근거 제한과 인용 검사, Golden Query 평가, Custom Span과 Trace ID 연결은 이 저장소의 애플리케이션 코드가 담당합니다.
 
-## 고정한 개발 환경
+## 30초 요약
 
-- Java 21 LTS (Eclipse Temurin)
-- Spring Boot 3.5.16
-- Spring AI 1.1.8
-- Maven Wrapper
-- PostgreSQL 17 + pgvector 0.8.6
-- Flyway
-- OpenTelemetry Collector 0.159.0
-- Tempo 2.10.8
-- Grafana 13.1.0
-
-AI 기능은 API 키 없이도 애플리케이션이 부팅되도록 기본값이 `none`입니다. 자동설정 Starter 대신 Spring AI OpenAI 핵심 라이브러리를 사용하며, 공급자 타입이 도메인으로 새지 않도록 `EmbeddingGateway` Adapter를 수동 구성합니다.
-Embedding과 답변 생성은 비용·timeout·실패 영향이 다르므로 `EmbeddingGateway`와 `GenerationGateway`로 분리합니다.
-
-### 버전 선택 이유와 trade-off
-
-| 선택 | 이유 | 감수하는 비용 |
+| 해결하려는 문제 | 구현한 내용 | 검증 근거 |
 |---|---|---|
-| Java 21 LTS | 장기 지원과 현재 Spring 생태계 호환성을 함께 확보 | 더 최신 Java 기능은 baseline에서 사용하지 않음 |
-| Spring Boot 3.5.16 | Spring AI 1.1 계열과 검증된 안정 조합이며 기존 Spring 경험을 활용 가능 | Boot 4의 최신 API와 개선 사항을 즉시 사용하지 않음 |
-| Spring AI 1.1.8 | Boot 3.5 baseline과 맞고 모델 연동에 필요한 공통 기능을 제공 | Spring AI 2의 breaking change와 신규 기능은 추후 migration 필요 |
-| Maven Wrapper 3.9.16 | 개발자와 CI가 동일한 Maven 버전을 사용 | Wrapper 버전 업데이트를 별도로 관리해야 함 |
+| 문서 전체를 LLM에 전달할 수 없고, 답변 근거를 선별해야 함 | Token 기반 Chunking → Embedding → pgvector 저장 → cosine distance 검색 | 실제 PostgreSQL을 사용하는 Testcontainers 통합 테스트 |
+| 검색 결과가 그럴듯해 보여도 품질을 설명하기 어려움 | 18개 Golden Query, Hit@K·MRR·negative return rate, threshold·Top-K·Chunk size 비교 | 고정 데이터셋, 실행 manifest, 결과 hash, 오프라인 재채점 |
+| API 지연이나 실패가 어느 단계에서 발생했는지 알기 어려움 | Retrieval·Embedding·DB Search·Generation·Citation Validation별 Span | Span 부모 관계·오류 태그·Tempo 전송 테스트 |
+| 클라이언트 요청과 내부 Trace를 연결하기 어려움 | 응답의 X-Trace-Id로 현재 HTTP server trace를 노출 | HTTP 통합 테스트와 Grafana Tempo 조회 흐름 |
 
-MVP가 완료되기 전에는 보안 수정이나 치명적 결함이 아닌 major upgrade를 하지 않습니다. Spring Boot 4 / Spring AI 2 전환은 검색 품질과 Trace baseline을 재현한 뒤 별도 ADR로 검토합니다.
+현재 구현 범위는 TXT/Markdown 문서와 exact vector search를 사용하는 단일 서비스입니다. ANN 인덱스, reranker, 답변 정확도 자동 평가는 아직 구현하지 않았습니다.
 
-## Architecture Decision Records
+## 구현 경계
 
-- [ADR-0001: Spring AI VectorStore 대신 직접 pgvector SQL 사용](docs/adr/0001-use-direct-pgvector-sql.md)
-- [ADR-0002: Exact Vector Search부터 시작](docs/adr/0002-start-with-exact-vector-search.md)
-- [ADR-0003: EmbeddingGateway와 GenerationGateway 분리](docs/adr/0003-separate-embedding-and-generation-gateways.md)
-- [ADR-0004: Spring Boot 3.5.16 / Spring AI 1.1.8 baseline](docs/adr/0004-pin-spring-boot-and-spring-ai-baseline.md)
+| 구분 | 담당 범위 |
+|---|---|
+| 이 저장소의 애플리케이션 코드 | 업로드 검증·SHA-256 중복 판정, Chunking/Embedding 상태와 트랜잭션, batch 결과·Vector 검증, pgvector SQL과 검색 적격 조건, Context/Prompt 조립과 citation 형식 검증, 평가 실행·report, RAG Custom Span과 `X-Trace-Id` |
+| Library / framework | Spring MVC·JDBC·Flyway, Spring AI `TokenTextSplitter`, JTokkit token 추정, Spring Boot의 HTTP server span 자동 계측 |
+| 외부 시스템 | OpenAI의 Embedding·Chat 추론, PostgreSQL/pgvector의 Vector 연산, Collector·Tempo·Grafana의 Trace 수집·저장·조회 |
 
-## 최초 실행
+대표 구현 진입점은 [EmbeddingService](src/main/java/com/portfolio/ragobservability/document/embedding/EmbeddingService.java), [RetrievalService](src/main/java/com/portfolio/ragobservability/retrieval/RetrievalService.java), [RetrievalRepository](src/main/java/com/portfolio/ragobservability/retrieval/RetrievalRepository.java), [RagService](src/main/java/com/portfolio/ragobservability/rag/RagService.java), [EvaluationRunner](src/main/java/com/portfolio/ragobservability/evaluation/EvaluationRunner.java), [RagTracing](src/main/java/com/portfolio/ragobservability/observability/RagTracing.java)입니다.
 
-Windows를 재부팅한 뒤 Docker Desktop을 한 번 실행하고 엔진이 준비될 때까지 기다립니다. 이후 PowerShell에서 다음을 실행합니다.
+## 문제 정의
 
-```powershell
+샘플 도메인은 DB connection timeout, CPU spike, deployment rollback에 관한 운영 문서 3개입니다. 목표는 이 문서에서 근거를 선별해 답변하는 작은 시스템을 만들고, 검색 결과와 요청 내부 과정을 코드·테스트·실험 결과로 설명 가능하게 만드는 것입니다.
+
+LLM에 질문을 전달하는 것만으로는 다음 문제를 해결할 수 없습니다.
+
+1. 어떤 문서를 어떤 크기로 나누고 벡터화할지 결정해야 합니다.
+2. 질의 벡터와 같은 모델·차원의 문서 벡터만 안전하게 검색해야 합니다.
+3. 검색 결과가 없을 때 생성을 생략하고, 답변이 실제 검색 근거를 인용하는지 확인해야 합니다.
+4. 검색 설정을 감으로 고르지 않고 재현 가능한 데이터로 비교해야 합니다.
+5. 한 요청 안에서 Embedding, DB 검색, LLM 생성 중 어디에서 시간이 들거나 실패했는지 추적해야 합니다.
+
+이 저장소는 이 다섯 문제를 데이터 상태, SQL, 평가 도구, Trace 구조로 나누어 다룹니다. 현재 성공 조건은 3개 문서·18개 고정 질문에서 문서 단위 Hit/MRR와 negative return을 반복 측정할 수 있고, 통합 테스트에서 API 응답의 Trace ID로 내부 Span 계층을 확인할 수 있는 것입니다. 이 범위를 넘어서는 일반화 성능이나 운영 규모는 주장하지 않습니다.
+
+## Architecture
+
+~~~mermaid
+flowchart LR
+    subgraph Client["Client"]
+        UI["React UI"]
+        HTTP["HTTP Client"]
+    end
+
+    subgraph App["Spring Boot Application"]
+        MVC["Spring MVC API"]
+
+        subgraph Ingestion["Document ingestion · explicit step APIs"]
+            DOC["Upload and document state"]
+            SPLIT["Token chunking"]
+            DEMB["Document embedding"]
+        end
+
+        subgraph Online["Online query"]
+            RET["Retrieval · /api/v1/search"]
+            RAG["RAG answer · /api/v1/answers"]
+            CTX["Context and prompt"]
+            GEN["Answer generation"]
+            CITE["Citation validation"]
+        end
+
+        subgraph Evaluation["Offline retrieval evaluation"]
+            GOLDEN["Golden dataset<br/>18 frozen queries"]
+            EVAL["Evaluation runner"]
+            REPORT["Queries · hits · summary<br/>manifest and hashes"]
+            COMPARE["Threshold · Top-K<br/>Chunk-size comparison"]
+        end
+
+        TRACE["HTTP server span<br/>and RAG custom spans"]
+    end
+
+    PG[("PostgreSQL 17<br/>pgvector")]
+    OAE["OpenAI Embedding API"]
+    OAC["OpenAI Chat API"]
+    COL["OpenTelemetry Collector"]
+    TEMPO["Tempo"]
+    GRAFANA["Grafana"]
+
+    UI --> MVC
+    HTTP --> MVC
+
+    MVC --> DOC
+    DOC --> SPLIT
+    SPLIT --> PG
+    DOC --> DEMB
+    DEMB --> OAE
+    DEMB --> PG
+
+    MVC --> RET
+    MVC --> RAG
+    RAG --> RET
+    RET --> OAE
+    RET --> PG
+    RAG --> CTX
+    CTX --> GEN
+    GEN -->|request| OAC
+    OAC -->|answer| CITE
+
+    GOLDEN --> EVAL
+    EVAL -->|same retrieval path| RET
+    EVAL --> REPORT --> COMPARE
+
+    MVC -. automatic HTTP tracing .-> TRACE
+    RET -. custom spans .-> TRACE
+    RAG -. custom spans .-> TRACE
+    TRACE -->|OTLP/HTTP| COL
+    COL -->|OTLP/gRPC| TEMPO
+    TEMPO --> GRAFANA
+~~~
+
+문서 적재와 온라인 질의는 분리했습니다. 업로드 직후 외부 API를 자동 호출하지 않으며, Chunking과 Embedding을 각각 명시적인 API로 실행합니다. 이 구조 덕분에 각 단계의 상태와 실패 지점을 따로 확인하고 재시도할 수 있습니다.
+
+상세 그림과 코드 근거: [전체 System Architecture](docs/diagrams/01-system-architecture.md)
+
+## RAG pipeline
+
+### 1. Document ingestion
+
+<details>
+<summary>Document ingestion diagram 펼치기</summary>
+
+~~~mermaid
+flowchart TD
+    UP["POST /api/v1/documents<br/>TXT or Markdown · max 1 MB"]
+    CHECK["Filename, extension, size,<br/>strict UTF-8 validation"]
+    HASH["SHA-256 of original bytes<br/>BOM removed from stored text"]
+    UNIQUE{"content_sha256<br/>already exists?"}
+    DUP["409 DOCUMENT_DUPLICATE"]
+    STORE[("document INSERT<br/>status=PENDING<br/>embedding_status=NOT_STARTED")]
+
+    PROCESS["POST /documents/{id}/process"]
+    CLAIM_C["Claim document<br/>status=PROCESSING"]
+    SPLIT["TokenTextSplitter<br/>target 600 tokens"]
+    VALID_C{"Valid chunks?<br/>1..500, nonblank"}
+    COMPLETE_C["REQUIRES_NEW complete<br/>replace all chunks"]
+    CHUNK_READY[("document_chunk rows<br/>document status=READY<br/>embedding_status=PENDING")]
+    FAIL_C["REQUIRES_NEW fail<br/>delete partial chunks<br/>status=FAILED"]
+
+    EMBED["POST /documents/{id}/embeddings"]
+    CLAIM_E["Claim embedding work<br/>clear previous vectors<br/>embedding_status=PROCESSING"]
+    BATCH["Chunk content batches<br/>default size 32"]
+    OPENAI["Embedding provider"]
+    VALID_E{"Count and 1536 dimensions<br/>finite and not all-zero"}
+    COMPLETE_E["REQUIRES_NEW complete<br/>save all vectors and metadata"]
+    READY[("embedding VECTOR(1536)<br/>provider and model<br/>embedding_status=READY")]
+    FAIL_E["REQUIRES_NEW fail<br/>clear all vectors<br/>embedding_status=FAILED"]
+
+    UP --> CHECK --> HASH --> UNIQUE
+    UNIQUE -->|yes| DUP
+    UNIQUE -->|no| STORE
+
+    STORE -->|explicit API call| PROCESS
+    PROCESS --> CLAIM_C --> SPLIT --> VALID_C
+    VALID_C -->|yes| COMPLETE_C --> CHUNK_READY
+    VALID_C -->|no| FAIL_C
+    SPLIT -. exception .-> FAIL_C
+    FAIL_C -->|retry process API| PROCESS
+
+    CHUNK_READY -->|explicit API call| EMBED
+    EMBED --> CLAIM_E --> BATCH --> OPENAI --> VALID_E
+    VALID_E -->|all batches valid| COMPLETE_E --> READY
+    VALID_E -->|invalid| FAIL_E
+    OPENAI -. provider exception .-> FAIL_E
+    FAIL_E -->|retry embedding API| EMBED
+~~~
+
+상세 그림과 코드 근거: [Document Ingestion Pipeline](docs/diagrams/02-document-ingestion-pipeline.md)
+
+</details>
+
+1. **Parsing:** [DocumentService](src/main/java/com/portfolio/ragobservability/document/DocumentService.java)는 최대 1MB의 TXT/Markdown 파일을 strict UTF-8로 읽습니다. 원본 byte의 SHA-256으로 중복 업로드를 막고, 저장할 문자열에서는 BOM을 제거합니다.
+
+2. **Chunking:** [SpringAiDocumentChunker](src/main/java/com/portfolio/ragobservability/document/chunk/SpringAiDocumentChunker.java)는 Spring AI의 TokenTextSplitter와 JTokkit 추정기를 사용합니다. 기본 목표 크기는 600 token, 문서당 최대 Chunk 수는 500입니다. 별도의 사용자 정의 overlap 로직은 없습니다.
+
+3. **상태 전이와 트랜잭션:** Chunking은 PENDING → PROCESSING → READY 또는 FAILED로 전이합니다. [DocumentProcessingTransactions](src/main/java/com/portfolio/ragobservability/document/chunk/DocumentProcessingTransactions.java)는 claim, 완료, 실패 처리를 REQUIRES_NEW 트랜잭션으로 분리하고, 실패 시 부분 Chunk를 제거합니다.
+
+4. **Embedding:** [EmbeddingService](src/main/java/com/portfolio/ragobservability/document/embedding/EmbeddingService.java)는 기본 32개씩 batch 호출합니다. [EmbeddingVectorValidator](src/main/java/com/portfolio/ragobservability/document/embedding/EmbeddingVectorValidator.java)는 응답 개수, 1536차원, 유한값, all-zero 여부를 검사합니다. 모든 batch가 성공한 뒤 한 트랜잭션에서 벡터와 provider/model metadata를 저장합니다.
+
+5. **Vector storage:** Flyway가 document와 document_chunk를 만들고 vector(1536) 컬럼을 관리합니다. 현재 vector ANN index는 없으며, 데이터 규모에 맞춰 exact scan부터 검증했습니다. 근거: [V1 migration](src/main/resources/db/migration/V1__create_document_schema.sql), [V2 migration](src/main/resources/db/migration/V2__add_document_raw_content.sql), [V3 migration](src/main/resources/db/migration/V3__add_document_embedding_state.sql)
+
+### 2. Retrieval
+
+<details>
+<summary>RAG retrieval and answer diagram 펼치기</summary>
+
+~~~mermaid
+flowchart TD
+    SEARCH["POST /api/v1/search"]
+    ANSWER["POST /api/v1/answers"]
+
+    VALID_S["Normalize query<br/>validate length, Top-K, threshold"]
+    VALID_A["Normalize question<br/>validate length, Top-K, threshold"]
+    GEN_ON{"Generation<br/>enabled?"}
+    GEN_OFF["503 GENERATION_DISABLED"]
+
+    EMB_ON{"Embedding<br/>enabled?"}
+    EMB_OFF["503 EMBEDDING_DISABLED"]
+    QEMB["Create one query embedding"]
+    VVALID{"One valid vector?<br/>configured dimensions"}
+    EMB_ERR["502 provider or<br/>validation error"]
+
+    ELIGIBLE["Eligible chunks only<br/>document READY · embedding READY<br/>same provider, model, dimensions"]
+    COSINE["Exact pgvector cosine search<br/>distance = embedding &lt;=&gt; query"]
+    FILTER["similarity threshold<br/>deterministic ordering<br/>LIMIT Top-K"]
+
+    SEARCH_OUT["Search response<br/>ranked chunks and metadata"]
+    EVIDENCE{"Any evidence?"}
+    NO_EVIDENCE["Fixed no-evidence answer<br/>generationCalled=false"]
+    CONTEXT["Numbered context<br/>S1, S2, ..."]
+    PROMPT["Prompt: use context only<br/>and cite source IDs"]
+    CHAT["Chat generation"]
+    CITE{"Citation syntax<br/>and ID range valid?"}
+    CITE_ERR["502 GENERATION_INVALID_RESPONSE"]
+    ANSWER_OUT["Answer response<br/>answer, sources, metadata"]
+
+    SEARCH --> VALID_S --> EMB_ON
+    ANSWER --> VALID_A --> GEN_ON
+    GEN_ON -->|no| GEN_OFF
+    GEN_ON -->|yes| EMB_ON
+
+    EMB_ON -->|no| EMB_OFF
+    EMB_ON -->|yes| QEMB --> VVALID
+    QEMB -. provider error .-> EMB_ERR
+    VVALID -->|no| EMB_ERR
+    VVALID -->|yes| ELIGIBLE --> COSINE --> FILTER
+
+    FILTER -->|search endpoint| SEARCH_OUT
+    FILTER -->|answer endpoint| EVIDENCE
+    EVIDENCE -->|no| NO_EVIDENCE
+    EVIDENCE -->|yes| CONTEXT --> PROMPT --> CHAT --> CITE
+    CITE -->|no| CITE_ERR
+    CITE -->|yes| ANSWER_OUT
+~~~
+
+상세 그림과 코드 근거: [RAG Retrieval Pipeline](docs/diagrams/03-rag-retrieval-pipeline.md)
+
+</details>
+
+[RetrievalService](src/main/java/com/portfolio/ragobservability/retrieval/RetrievalService.java)는 질의를 정규화한 뒤 문서와 같은 Embedding Gateway로 query vector를 만듭니다. 검색 시 다음 조건을 모두 만족하는 Chunk만 후보가 됩니다.
+
+- 문서의 Chunking 상태와 Embedding 상태가 모두 READY
+- 벡터가 null이 아님
+- 저장된 provider, model, dimensions가 현재 질의 설정과 일치
+- cosine similarity가 minimumSimilarity 이상
+- topK는 1~20 범위
+
+핵심 검색은 추상화 뒤에 숨기지 않고 [RetrievalRepository](src/main/java/com/portfolio/ragobservability/retrieval/RetrievalRepository.java)에 SQL로 명시했습니다.
+
+~~~sql
+dc.embedding <=> CAST(:queryEmbedding AS vector) AS distance
+
+WHERE d.status = 'READY'
+  AND d.embedding_status = 'READY'
+  AND dc.embedding_provider = :embeddingProvider
+  AND dc.embedding_model = :embeddingModel
+  AND vector_dims(dc.embedding) = :dimensions
+
+-- cosine similarity = 1 - cosine distance
+WHERE distance <= 1.0 - :minimumSimilarity
+ORDER BY distance, document_id, chunk_index, chunk_id
+LIMIT :topK
+~~~
+
+동점 결과도 반복 실행에서 같은 순서가 되도록 document_id, chunk_index, chunk_id까지 정렬합니다. 현재 검색에는 hybrid keyword search, metadata filter, reranking, 문서 단위 deduplication이 없습니다.
+
+### 3. Answer generation
+
+[RagService](src/main/java/com/portfolio/ragobservability/rag/RagService.java)는 검색 결과를 S1, S2 순서의 context로 구성합니다. [RagPromptBuilder](src/main/java/com/portfolio/ragobservability/rag/RagPromptBuilder.java)는 제공된 context만 사용하고 근거 ID를 인용하도록 지시합니다.
+
+검색 결과가 없으면 LLM을 호출하지 않고 고정된 no-evidence 응답을 반환합니다. 결과가 있으면 [CitationValidator](src/main/java/com/portfolio/ragobservability/rag/CitationValidator.java)가 최소 한 개의 [Sn] 인용과 ID 범위를 검사합니다. 이 검사는 인용 형식 검증이며, 문장별 사실성이나 의미적 뒷받침까지 판정하지는 않습니다.
+
+## Data model
+
+<details>
+<summary>Database relation diagram 펼치기</summary>
+
+~~~mermaid
+erDiagram
+    DOCUMENT ||--o{ DOCUMENT_CHUNK : "ON DELETE CASCADE"
+
+    DOCUMENT {
+        bigint id PK
+        varchar title
+        varchar original_filename
+        varchar source_type
+        string content_sha256 UK
+        text raw_content
+        varchar status
+        varchar error_code
+        int retry_count
+        varchar embedding_status
+        varchar embedding_error_code
+        int embedding_retry_count
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    DOCUMENT_CHUNK {
+        bigint id PK
+        bigint document_id FK
+        int chunk_index
+        text content
+        int token_count
+        varchar embedding_provider
+        varchar embedding_model
+        vector_1536 embedding
+        timestamptz created_at
+    }
+~~~
+
+document와 document_chunk는 1:N 관계이며 문서 삭제 시 Chunk도 cascade 삭제됩니다. 원문 SHA-256과 문서별 chunk_index에는 unique 제약이 있고, Chunking 상태와 Embedding 상태·오류·retry 횟수는 분리되어 있습니다. 현재 B-tree index만 존재하며 Vector ANN index는 없습니다.
+
+상세 그림과 코드 근거: [주요 DB 관계](docs/diagrams/05-database-relations.md)
+
+</details>
+
+## Observability
+
+HTTP 자동 계측 위에 RAG 도메인 단계를 Custom Span으로 추가했습니다.
+
+<details>
+<summary>OpenTelemetry trace and span diagram 펼치기</summary>
+
+~~~mermaid
+flowchart TD
+    CLIENT["Client"]
+    SERVER["HTTP SERVER span<br/>Trace ID"]
+    HEADER["Response header<br/>X-Trace-Id = current Trace ID"]
+
+    subgraph AnswerTrace["POST /api/v1/answers · normal custom span tree"]
+        ANSWER["rag.answer"]
+        RET["rag.retrieval"]
+        QEMB["rag.query_embedding"]
+        VSEARCH["rag.vector_search"]
+        NOEV[/"rag.answer tags<br/>rag.outcome=no_evidence<br/>rag.generation.called=false"/]
+        CTX["rag.context_build<br/>only with evidence"]
+        GEN["rag.generation<br/>only with evidence"]
+        CITE["rag.citation_validation<br/>only with evidence"]
+
+        ANSWER --> RET
+        ANSWER --> CTX
+        ANSWER --> GEN
+        ANSWER --> CITE
+        RET --> QEMB
+        RET --> VSEARCH
+        RET -. empty result .-> NOEV
+    end
+
+    subgraph SearchTrace["POST /api/v1/search · custom span tree"]
+        SRET["rag.retrieval"]
+        SQEMB["rag.query_embedding"]
+        SVSEARCH["rag.vector_search"]
+        SRET --> SQEMB
+        SRET --> SVSEARCH
+    end
+
+    OTLP["OTLP/HTTP exporter<br/>localhost:4318/v1/traces"]
+    COL["OpenTelemetry Collector<br/>batch timeout 1 s"]
+    TEMPO["Tempo<br/>retention 24 h"]
+    GRAFANA["Grafana Explore<br/>lookup by Trace ID"]
+
+    CLIENT --> SERVER
+    SERVER -->|answers| ANSWER
+    SERVER -->|search| SRET
+    SERVER --> HEADER --> CLIENT
+
+    SERVER -. finished spans .-> OTLP
+    OTLP --> COL
+    COL -->|OTLP/gRPC| TEMPO
+    TEMPO --> GRAFANA
+    CLIENT -. copy X-Trace-Id .-> GRAFANA
+~~~
+
+상세 그림과 코드 근거: [OpenTelemetry Trace and Span Flow](docs/diagrams/04-opentelemetry-trace-flow.md)
+
+</details>
+
+검색 근거가 없으면 context_build, generation, citation_validation Span을 만들지 않고 rag.generation.called=false와 rag.outcome=no_evidence를 기록합니다. 오류에는 allowlist 기반의 안전한 rag.error.code만 남기며 질문, Chunk 전문, Prompt, Vector, provider 원문 오류는 Span attribute에 기록하지 않습니다.
+
+구현은 [RagTracing](src/main/java/com/portfolio/ragobservability/observability/RagTracing.java), 구조 검증은 [RagTracingTests](src/test/java/com/portfolio/ragobservability/observability/RagTracingTests.java)와 [TracingHttpTests](src/test/java/com/portfolio/ragobservability/observability/TracingHttpTests.java)에 있습니다.
+
+### X-Trace-Id
+
+[TraceHeaderFilter](src/main/java/com/portfolio/ragobservability/observability/TraceHeaderFilter.java)는 search와 answers 요청에서 현재 HTTP server span의 Trace ID를 읽어 응답 헤더 X-Trace-Id에 넣습니다.
+
+이 헤더는 별도의 UUID를 생성하지 않으며, 들어온 X-Trace-Id를 propagation header로 채택하지도 않습니다. Tracing이 비활성화되면 응답 헤더도 생성되지 않습니다.
+
+Trace는 OTLP/HTTP → OpenTelemetry Collector → Tempo로 전달되고 Grafana에서 조회합니다. 현재 Compose 구성은 trace pipeline만 포함하며, metrics·logs pipeline, dashboard, alert는 구현 범위 밖입니다. 재현 절차는 [observability lab](docs/observability-lab.md), 실제 Trace ID·Span 수·검증 조건은 [2026-09-06 live path 검증](docs/evidence/observability-verification-2026-09-06.md)에 기록했습니다.
+
+## 코드로 확인되는 문제 해결
+
+| 문제 | 선택과 구현 | 확인 근거 |
+|---|---|---|
+| Embedding batch 중간 실패가 일부 Vector만 남길 수 있음 | 모든 batch의 개수·차원·값을 먼저 검증하고, 완료 시 한 트랜잭션에서 저장합니다. 실패 경로는 기존 Vector와 metadata를 지우고 Embedding 상태만 `FAILED`로 전환합니다. | [EmbeddingService](src/main/java/com/portfolio/ragobservability/document/embedding/EmbeddingService.java), [EmbeddingTransactions](src/main/java/com/portfolio/ragobservability/document/embedding/EmbeddingTransactions.java), [EmbeddingApiIntegrationTests](src/test/java/com/portfolio/ragobservability/document/embedding/EmbeddingApiIntegrationTests.java) |
+| 다른 model·차원의 Vector가 검색 후보에 섞일 수 있음 | query Embedding의 provider/model/dimension을 검색 SQL의 적격 조건으로 사용하고, `READY` 문서와 non-null Vector만 대상으로 제한했습니다. | [RetrievalRepository](src/main/java/com/portfolio/ragobservability/retrieval/RetrievalRepository.java), [RetrievalApiIntegrationTests](src/test/java/com/portfolio/ragobservability/retrieval/RetrievalApiIntegrationTests.java) |
+| 검색 근거가 없는데도 LLM을 호출하면 근거 없는 답과 비용이 생김 | Retrieval 결과가 비면 정해진 no-evidence 응답을 즉시 반환합니다. Generation·citation 검증은 호출하지 않고 Trace에도 해당 Span을 만들지 않습니다. | [RagService](src/main/java/com/portfolio/ragobservability/rag/RagService.java), [RagApiIntegrationTests](src/test/java/com/portfolio/ragobservability/rag/RagApiIntegrationTests.java), [TracingHttpTests](src/test/java/com/portfolio/ragobservability/observability/TracingHttpTests.java) |
+| Similarity threshold를 높이면 오탐과 정답 손실이 함께 변함 | 같은 Top-5 결과를 threshold별로 재채점했습니다. 0.3은 관련 질문 Hit@5를 유지했지만 hard negative 3개를 모두 통과시켰고, 0.5는 관련 Hit@5가 0.3333으로 감소해 실험값으로 기본 설정을 자동 변경하지 않았습니다. | [threshold 비교 CSV](docs/evidence/threshold-comparison.csv), [threshold validation](docs/threshold-validation.md) |
+| 실제 Collector 검증 테스트가 같은 Span을 두 번 OTLP 전송함 | Spring Boot auto exporter와 테스트 composite exporter의 중복을 확인했습니다. 테스트 설정에서 명시적 OTLP exporter와 in-memory exporter를 각각 한 번만 등록해 단독·전체 suite 동작을 맞췄습니다. | [TracingHttpTests](src/test/java/com/portfolio/ragobservability/observability/TracingHttpTests.java), [Trace 검증 기록](docs/evidence/observability-verification-2026-09-06.md) |
+
+## Golden Query evaluation
+
+검색 품질을 샘플 질문 몇 개의 눈대중으로 판단하지 않기 위해 평가를 코드와 데이터로 분리했습니다.
+
+- [retrieval-validation-set-v1.json](evaluation/retrieval-validation-set-v1.json): direct 6, paraphrased 6, hard negative 3, unrelated 3의 총 18개 질문
+- [GoldenDataset](src/main/java/com/portfolio/ragobservability/evaluation/GoldenDataset.java): schema, 중복, 원문 hash 검증
+- [EvaluationCorpus](src/main/java/com/portfolio/ragobservability/evaluation/EvaluationCorpus.java): 정확히 3개 문서가 READY인지, 모델·차원과 원문 hash가 같은지 확인
+- [EvaluationRunner](src/main/java/com/portfolio/ragobservability/evaluation/EvaluationRunner.java): 각 질문을 한 번 검색하고 query·hit·summary·manifest를 저장
+- threshold와 Top-K 비교: 저장된 Top-5 결과를 오프라인에서 다시 채점하므로 추가 OpenAI 호출 없음
+- Chunk size 비교: 300/600/900마다 새 PostgreSQL Testcontainer를 만들고 같은 query embedding을 재사용
+
+지표는 정답 문서가 Top-K에 포함됐는지 보는 Hit@K와 첫 정답 순위를 보는 MRR@K입니다. 답이 없는 질문은 별도로 negativeReturnRate를 계산합니다. 현재 평가는 **문서 단위 검색 품질**만 측정하며 Chunk의 근거 충분성이나 최종 답변의 factuality는 측정하지 않습니다.
+
+### 감사 시점의 로컬 결과
+
+아래 값은 3개 문서와 18개 질문으로 수행한 내부 실험 결과입니다. 일반적인 RAG 성능을 주장하는 수치가 아닙니다. raw run 디렉터리 `evaluation/results`는 gitignore 대상이지만, 검토 가능한 집계 CSV와 run ID·dataset hash·source commit/dirty 상태는 [평가 증거와 재현 범위](docs/evidence/evaluation-provenance.md)에 별도로 보존했습니다.
+
+| 조건 | 관련 질문 12개 | 답 없는 질문 6개 | 관찰 |
+|---|---:|---:|---|
+| Top-K 5, threshold -1.0 | Hit@5 1.0000, MRR@5 0.9167 | negative return 1.0000 | 모든 결과를 남긴 baseline |
+| Top-K 5, threshold 0.3 | Hit@5 1.0000, MRR@5 0.9167 | negative return 0.5000 | 관련 검색은 유지했지만 hard negative는 모두 통과 |
+| Top-K 5, threshold 0.5 | Hit@5 0.3333, MRR@5 0.3333 | negative return 0.1667 | 오탐은 줄었지만 관련 근거도 크게 손실 |
+| threshold 0.3, K=1 | Hit@1 0.8333, MRR@1 0.8333 | negative return 0.5000 | 2개 관련 질문의 정답 문서를 놓침 |
+| threshold 0.3, K=2/3/5 | Hit 1.0000, MRR 0.9167 | negative return 0.5000 | 문서 검색 성공률은 같지만 context 충분성은 별도 문제 |
+
+Chunk size 300/600/900은 모두 Hit@5 1.0000이었지만 MRR과 반환 token 수가 달랐습니다. 이 결과만으로 최적 크기를 확정하지 않았고 운영 기본값 600, 답변 threshold 0.5도 자동 변경하지 않았습니다.
+
+수치 원본 스냅샷은 [threshold CSV](docs/evidence/threshold-comparison.csv), [Top-K CSV](docs/evidence/topk-comparison.csv), [Chunk size CSV](docs/evidence/chunk-size-comparison.csv)에서 확인할 수 있습니다. 실험 설계와 제한은 [threshold validation](docs/threshold-validation.md), [Top-K validation](docs/topk-validation.md), [Chunk size validation](docs/chunk-size-validation.md)에 기록했습니다.
+
+## 테스트와 검증
+
+외부 API 자체보다 그 전후의 계약을 Fake Gateway와 실제 PostgreSQL로 검증합니다.
+
+| 계층 | 검증 대상 | 대표 테스트 |
+|---|---|---|
+| Unit | UTF-8·hash, Chunk 경계, vector 검증, 상태 전이, citation, 평가 계산 | [SpringAiDocumentChunkerTests](src/test/java/com/portfolio/ragobservability/document/chunk/SpringAiDocumentChunkerTests.java), [EmbeddingServiceTests](src/test/java/com/portfolio/ragobservability/document/embedding/EmbeddingServiceTests.java), [ContextAndCitationTests](src/test/java/com/portfolio/ragobservability/rag/ContextAndCitationTests.java) |
+| DB integration | Flyway V1~V3, vector 저장, cosine SQL, provider/model/dimension filter, rollback | [EmbeddingApiIntegrationTests](src/test/java/com/portfolio/ragobservability/document/embedding/EmbeddingApiIntegrationTests.java), [RetrievalApiIntegrationTests](src/test/java/com/portfolio/ragobservability/retrieval/RetrievalApiIntegrationTests.java) |
+| HTTP integration | upload → chunk → embedding → search → answer, validation, status code | [DocumentApiIntegrationTests](src/test/java/com/portfolio/ragobservability/document/DocumentApiIntegrationTests.java), [RagApiIntegrationTests](src/test/java/com/portfolio/ragobservability/rag/RagApiIntegrationTests.java) |
+| Observability | Span 계층, no-evidence branch, error code, X-Trace-Id, 선택적 Tempo 조회 | [TracingHttpTests](src/test/java/com/portfolio/ragobservability/observability/TracingHttpTests.java) |
+| Evaluation | dataset 고정, metric 계산, manifest 무결성, threshold·Top-K·Chunk 비교 | [evaluation tests](src/test/java/com/portfolio/ragobservability/evaluation) |
+| Frontend | API 상태 처리와 결과 렌더링 | [frontend tests](frontend/src) |
+
+2026-09-06 로컬 감사 기준:
+
+- Maven: 128개 중 124개 통과, 4개 skip, failure/error 0
+- skip 4개: 실제 OpenAI 2개, 실제 Tempo 1개, opt-in browser integration 1개
+- Testcontainers 기반 PostgreSQL 통합 테스트 실행
+- Vitest: 16개 통과
+- TypeScript 검사와 Vite production build 통과
+
+실행 환경, 명령, dirty worktree 조건을 포함한 기록: [테스트 검증 기록](docs/evidence/test-verification-2026-09-06.md)
+
+~~~powershell
+.\mvnw.cmd clean test
+
+Set-Location frontend
+npm test
+npm run build
+~~~
+
+## 주요 기술적 의사결정
+
+| 결정 | 이유 | 현재 trade-off |
+|---|---|---|
+| VectorStore 추상화 대신 pgvector SQL 직접 작성 | cosine 계산, 적격 조건, 동점 정렬을 코드에서 명확히 통제 | DB 종속성이 생기지만 검색 계약을 테스트하기 쉬움 |
+| ANN index보다 exact search 우선 | 3개 문서의 품질 실험에서 근사 검색 변수를 먼저 제거 | 대규모 데이터 성능은 아직 증명하지 못함 |
+| Embedding과 Generation Gateway 분리 | 검색 평가에서 Generation 0회를 보장하고 provider 실패를 독립 처리 | 설정과 상태 모델이 늘어남 |
+| Chunking과 Embedding 상태 분리 | 업로드 이후 각 단계를 관찰하고 실패 시 재시도 가능 | 현재 작업은 동기 API이며 queue·lease recovery는 없음 |
+| AI provider 기본값 none | API key가 없는 로컬·테스트에서 외부 호출을 막음 | 실제 검색·답변 실행에는 명시적 설정 필요 |
+| 원문 대신 안전한 Trace attribute만 기록 | 관측성과 데이터 노출 위험 사이의 경계 설정 | Trace만으로 질문 내용을 재현할 수 없음 |
+
+결정 배경은 [ADR 0001](docs/adr/0001-use-direct-pgvector-sql.md), [ADR 0002](docs/adr/0002-start-with-exact-vector-search.md), [ADR 0003](docs/adr/0003-separate-embedding-and-generation-gateways.md), [ADR 0004](docs/adr/0004-pin-spring-boot-and-spring-ai-baseline.md)에 남겼습니다.
+
+## 기술 스택
+
+- Backend: Java 21, Spring Boot 3.5.16, Spring AI 1.1.8, Spring JDBC
+- Data: PostgreSQL 17, pgvector 0.8.6, Flyway
+- AI: OpenAI Embedding과 Chat Gateway
+- Observability: Micrometer Tracing, OpenTelemetry, OTel Collector, Tempo, Grafana
+- Test: JUnit 5, Spring Boot Test, Testcontainers, Fake Gateway
+- UI: React 19.2, TypeScript 5.9, Vite 7.3, Vitest, Playwright
+- Local infrastructure: Docker Compose
+
+## 로컬 실행
+
+요구 사항은 Java 21, Docker Desktop, Node.js입니다. PowerShell 기준 실행 순서입니다.
+
+~~~powershell
+Copy-Item .env.example .env
 .\scripts\check-env.ps1
 .\scripts\dev.ps1 up
-.\mvnw.cmd clean test
 .\scripts\run-app.ps1
-```
-
-확인 주소:
-
-- Spring Boot health: <http://localhost:8080/actuator/health>
-- Grafana: <http://localhost:3000>
-- Collector health: <http://localhost:13133>
-
-Grafana는 로컬 개발용으로 로그인 화면을 비활성화했고 Tempo datasource를 자동 등록합니다.
-
-## 자주 쓰는 명령
-
-```powershell
-# 전체 인프라 상태
-.\scripts\dev.ps1 status
-
-# 전체 인프라 로그
-.\scripts\dev.ps1 logs
-
-# 컨테이너 중지(데이터 볼륨은 유지)
-.\scripts\dev.ps1 down
-
-# 의존성 및 테스트 검증
-.\mvnw.cmd clean verify
-```
-
-DB 데이터까지 삭제하는 `docker compose down -v`는 복구가 어려우므로 문서의 기본 명령에 포함하지 않았습니다.
-
-## Document API
-
-현재는 TXT/Markdown 원문 등록과 조회, 제목 변경, 명시적 Chunking과 Embedding, 삭제를 지원합니다. Chunking 상태와 Embedding 상태는 독립적으로 관리되며 API로 원문이나 처리 상태를 직접 변경할 수는 없습니다.
-
-```powershell
-# TXT 문서 등록(제목을 생략하면 파일명에서 생성)
-curl.exe -X POST "http://localhost:8080/api/v1/documents" `
-  -F "file=@README.md;type=text/markdown" `
-  -F "title=DB Timeout Runbook"
-
-# 문서 목록과 상태 필터
-curl.exe "http://localhost:8080/api/v1/documents?page=0&size=20&status=PENDING"
-
-# 상세 조회
-curl.exe "http://localhost:8080/api/v1/documents/1"
-
-# 원문을 600-token 기준으로 Chunking
-curl.exe -X POST "http://localhost:8080/api/v1/documents/1/process"
-
-# 생성된 Chunk 조회
-curl.exe "http://localhost:8080/api/v1/documents/1/chunks"
-
-# Chunk를 1536차원 Embedding으로 변환해 pgvector에 저장
-curl.exe -X POST "http://localhost:8080/api/v1/documents/1/embeddings"
-
-# 벡터 배열을 제외한 Embedding 처리 상태 조회
-curl.exe "http://localhost:8080/api/v1/documents/1/embeddings"
-
-# 제목 변경
-curl.exe -X PATCH "http://localhost:8080/api/v1/documents/1" `
-  -H "Content-Type: application/json" `
-  -d '{"title":"변경한 제목"}'
-
-# 문서 삭제
-curl.exe -X DELETE "http://localhost:8080/api/v1/documents/1"
-```
-
-- 지원 확장자: `.txt`, `.md`
-- 문자 인코딩: UTF-8
-- 파일 크기 제한: 1MB
-- 기본 Chunk 크기: 600 tokens, 문서당 최대 500 chunks
-- Chunking 처리 가능 상태: `PENDING`, `FAILED` (`FAILED` 재처리 시 `retryCount` 증가)
-- Embedding 상태: `NOT_STARTED → PENDING → PROCESSING → READY/FAILED`
-- Embedding batch 크기: 기본 32개, 실패 시 일부 벡터를 저장하지 않음
-- 같은 원본 바이트의 SHA-256이 이미 등록되어 있으면 `409 Conflict`
-- 오류 응답: `application/problem+json`과 식별 가능한 `code` 속성
-
-## Retrieval API
-
-질문을 기존 Embedding 모델의 1536차원 벡터로 변환하고, Chunking과 Embedding이 모두 `READY`인 Chunk에서 pgvector cosine exact search를 실행합니다. HNSW 등의 근사 인덱스는 사용하지 않습니다.
-
-전체 흐름을 IntelliJ에서 한 단계씩 확인하려면 [Retrieval 역주행 수동 실습](docs/retrieval-lab-results.md)을 열고 [실행 요청 모음](http/retrieval-lab.http)을 위에서 아래로 실행합니다. 실제 OpenAI 호출은 비용과 학습 흐름을 통제할 수 있도록 일괄 자동화하지 않았습니다.
-
-```powershell
-curl.exe -X POST "http://localhost:8080/api/v1/search" `
-  -H "Content-Type: application/json" `
-  -d '{"query":"DB connection timeout은 무엇을 확인해야 하나요?","topK":5,"minimumSimilarity":0.0}'
-```
-
-- `query`: 앞뒤 공백을 제거한 후 1~2,000자
-- `topK`: 1~20, 기본값 5
-- `minimumSimilarity`: -1.0~1.0, 기본값 0.0
-- 현재 Query Embedding과 provider, model, dimensions가 같은 Chunk만 검색
-- 검색 결과가 없으면 `200 OK`와 빈 `results` 반환
-- API Key 없이 기본 부팅은 가능하지만 검색 요청은 `503 EMBEDDING_DISABLED` 반환
-- query, query vector, API Key는 로그나 Trace attribute에 기록하지 않음
-
-## RAG Answer API
-
-검색된 Chunk를 `[S1]`, `[S2]` Source로 조립한 뒤 Generation 모델이 근거가 포함된 답변을 생성합니다. 실제 Retrieval Source는 LLM 본문과 별도로 반환하며, 존재하지 않는 Source ID나 인용 없는 답변은 `502 GENERATION_INVALID_RESPONSE`로 거부합니다.
-
-Retrieval 실습을 먼저 완료한 다음 [RAG 수동 실습 기록지](docs/rag-lab-results.md)를 열고 [RAG 실행 요청 모음](http/rag-lab.http)을 위에서 아래로 실행합니다.
-
-```powershell
-curl.exe -X POST "http://localhost:8080/api/v1/answers" `
-  -H "Content-Type: application/json" `
-  -d '{"question":"DB 연결을 제때 얻지 못할 때 무엇을 확인해야 하나요?","topK":5,"minimumSimilarity":0.5}'
-```
-
-- `question`: 앞뒤 공백을 제거한 후 1~2,000자
-- `topK`: 1~20, 기본값 5
-- `minimumSimilarity`: -1.0~1.0, 답변용 기본값 0.5
-- 결과가 없으면 LLM을 호출하지 않고 `제공된 문서만으로는 확인할 수 없습니다.` 반환
-- Context 전문은 모델에 전달하지만 공개 Source에는 최대 500자의 excerpt만 반환
-- API Key 없이 기본 부팅은 가능하지만 답변 요청은 `503 GENERATION_DISABLED` 반환
-- 질문, Context, Prompt, API Key는 로그나 Trace attribute에 기록하지 않음
-
-## 환경변수
-
-로컬 기본값은 `.env.example`에 정의되어 있습니다. `.env`는 개발자별 실제 값과 비밀정보를 담는 파일이며 Git에서 제외됩니다.
-
-### PostgreSQL 컨테이너
-
-| 변수 | 필수 여부 | 기본값 | 용도 | 민감정보 |
-|---|---|---|---|---|
-| `POSTGRES_DB` | 선택 | `rag_observability` | 컨테이너가 생성할 DB 이름 | 아니요 |
-| `POSTGRES_USER` | 선택 | `rag_app` | 컨테이너 DB 사용자 | 아니요 |
-| `POSTGRES_PASSWORD` | 로컬 실행 시 필수 | `rag_local_password` | 컨테이너 DB 비밀번호 | 예 |
-| `POSTGRES_PORT` | 선택 | `5432` | 호스트에 공개할 PostgreSQL 포트 | 아니요 |
-
-### Spring Datasource
-
-| 변수 | 필수 여부 | 기본값 | 용도 | 민감정보 |
-|---|---|---|---|---|
-| `DB_HOST` | 선택 | `localhost` | Spring Boot가 연결할 DB 호스트 | 아니요 |
-| `DB_PORT` | 선택 | `5432` | Spring Boot가 연결할 DB 포트 | 아니요 |
-| `DB_NAME` | 선택 | `rag_observability` | Spring Boot가 사용할 DB 이름 | 아니요 |
-| `DB_USER` | 선택 | `rag_app` | Spring Datasource 사용자 | 아니요 |
-| `DB_PASSWORD` | 로컬 실행 시 필수 | `rag_local_password` | Spring Datasource 비밀번호 | 예 |
-
-### AI 모델 예약값
-
-| 변수 | 필수 여부 | 기본값 | 용도 | 민감정보 |
-|---|---|---|---|---|
-| `SPRING_AI_MODEL_CHAT` | 선택 | `none` | Generation Gateway provider (`none` 또는 `openai`) | 아니요 |
-| `SPRING_AI_MODEL_EMBEDDING` | 선택 | `none` | Embedding Gateway provider (`none` 또는 `openai`) | 아니요 |
-| `OPENAI_API_KEY` | AI 활성화 시 필수 | 빈 값 | OpenAI API 인증 | 예 |
-| `OPENAI_BASE_URL` | 선택 | `https://api.openai.com` | OpenAI 호환 API base URL | 아니요 |
-| `CHAT_MODEL` | 선택 | `gpt-4.1-mini` | 답변 생성에 사용할 모델 예약값 | 아니요 |
-| `EMBEDDING_MODEL` | 선택 | `text-embedding-3-small` | Embedding에 사용할 모델 예약값 | 아니요 |
-| `EMBEDDING_DIMENSIONS` | 선택 | `1536` | 모델 벡터와 pgvector 컬럼의 차원 | 아니요 |
-| `RAG_EMBEDDING_BATCH_SIZE` | 선택 | `32` | 한 번의 공급자 요청에 포함할 Chunk 수 | 아니요 |
-| `RAG_EMBEDDING_CONNECT_TIMEOUT` | 선택 | `3s` | Embedding 공급자 연결 제한 시간 | 아니요 |
-| `RAG_EMBEDDING_READ_TIMEOUT` | 선택 | `30s` | Embedding 공급자 응답 제한 시간 | 아니요 |
-| `RAG_RETRIEVAL_TOP_K` | 선택 | `5` | Vector Search의 기본 최대 결과 수 | 아니요 |
-| `RAG_RETRIEVAL_MIN_SIMILARITY` | 선택 | `0.0` | Vector Search의 기본 최소 cosine similarity | 아니요 |
-| `RAG_GENERATION_CONNECT_TIMEOUT` | 선택 | `3s` | 답변 생성 공급자 연결 제한 시간 | 아니요 |
-| `RAG_GENERATION_READ_TIMEOUT` | 선택 | `60s` | 답변 생성 공급자 응답 제한 시간 | 아니요 |
-| `RAG_GENERATION_MAX_OUTPUT_TOKENS` | 선택 | `600` | 답변 생성 최대 출력 token | 아니요 |
-| `RAG_ANSWER_MINIMUM_SIMILARITY` | 선택 | `0.5` | RAG 답변에 사용할 최소 검색 유사도 | 아니요 |
-| `RAG_SOURCE_EXCERPT_LENGTH` | 선택 | `500` | 답변 API Source excerpt 최대 문자 수 | 아니요 |
-
-### OpenTelemetry
-
-| 변수 | 필수 여부 | 기본값 | 용도 | 민감정보 |
-|---|---|---|---|---|
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | 선택 | `http://localhost:4318/v1/traces` | Spring Boot Trace를 전송할 Collector OTLP/HTTP 주소 | 아니요 |
-| `OTEL_TRACES_SAMPLER_PROBABILITY` | 선택 | `1.0` | 로컬 Trace 샘플링 비율 | 아니요 |
-
-### Document Chunking
-
-| 변수 | 필수 여부 | 기본값 | 용도 | 민감정보 |
-|---|---|---|---|---|
-| `RAG_CHUNK_SIZE_TOKENS` | 선택 | `600` | TokenTextSplitter의 목표 Chunk 크기 | 아니요 |
-| `RAG_MAX_CHUNKS_PER_DOCUMENT` | 선택 | `500` | 한 문서에서 저장할 수 있는 최대 Chunk 수 | 아니요 |
-
-## AI 설정
-
-실제 Embedding과 답변 생성을 검증할 때만 `.env`에서 아래 값을 활성화합니다. `.env`는 Git에 커밋되지 않습니다.
-
-```dotenv
-SPRING_AI_MODEL_CHAT=openai
-SPRING_AI_MODEL_EMBEDDING=openai
-OPENAI_API_KEY=실제_키
-```
-
-API 키, 원문 질문, Chunk 전문과 Prompt 전문은 로그나 Trace attribute에 기록하지 않습니다.
-
-## 프로젝트 범위
-
-### MVP 필수
-
-- TXT/MD 문서 등록, SHA-256 중복 방지와 처리 상태·실패 재시도
-- Chunking과 Embedding 생성·저장
-- pgvector cosine exact search, Top-K와 minimum similarity
-- 실제 Source ID가 연결된 RAG 답변과 근거 부족 질문의 명시적 거절
-- Golden Query 기반 Hit@K·MRR·p50/p95 평가
-- OpenTelemetry Trace와 Chunk Size × Top-K 재현 실험
-
-### MVP 권장 품질
-
-- Testcontainers 기반 DB 통합 테스트와 Fake Gateway 단위 테스트
-- 파일 크기·Chunk 수·문자열 길이 등 입력 제한
-- PostgreSQL 키워드 검색과 Vector Search baseline 비교
-- Retrieval/E2E latency, Context token과 요청당 예상 비용 측정
-
-### MVP 이후 확장 후보
-
-- PDF 텍스트 추출
-- 인증·Workspace와 데모 UI
-- HNSW, Hybrid Search와 Reranker
-- Prometheus Metrics와 Loki Logs
-
-### 이번 프로젝트에서 제외
-
-- Kubernetes, Kafka와 Redis
-- 자체 Embedding/LLM 모델 서빙
-- 멀티에이전트
-- PDF OCR
-- 여러 AI Provider의 실제 동시 구현
-
-## 현재 구현 상태
-
-개발 환경과 0단계 기준 결정·문서화, Document CRUD, Chunking, Embedding, Retrieval과 RAG 답변 생성까지 완료한 상태입니다.
-
-- Maven/Java 21 프로젝트 뼈대
-- pgvector DB와 Flyway 초기 스키마
-- Actuator health
-- OTel Collector → Tempo → Grafana 로컬 스택
-- OpenAI 모델을 나중에 안전하게 활성화할 환경변수
-- Windows 실행/검증 스크립트
-- MVP 범위, 환경변수 표와 네 개의 ADR
-- TXT/Markdown 업로드와 PostgreSQL 원문 저장
-- 문서 목록·상세 조회, 제목 변경과 cascade 삭제
-- SHA-256 중복 방지, 입력 제한과 ProblemDetail 오류 응답
-- Testcontainers 기반 Document API 통합 테스트
-- Spring AI TokenTextSplitter 기반 600-token Chunking과 token count 저장
-- `PENDING → PROCESSING → READY/FAILED` 상태 전이와 실패 재시도
-- 조건부 상태 선점, batch insert와 부분 Chunk rollback 검증
-- 독립된 Embedding 상태·오류·재시도 모델과 동시 처리 방지
-- OpenAI/Disabled/Fake `EmbeddingGateway` 분리와 API Key 없는 기본 부팅
-- 32개 단위 batch 호출, 1536차원·유한값·non-zero 검증
-- pgvector 직접 SQL 저장과 실패 시 전체 vector rollback
-- Query Embedding과 provider/model/dimensions가 일치하는 Chunk만 검색
-- pgvector cosine exact search, Top-K와 minimum similarity 필터
-- 재현 가능한 tie-break 정렬과 vector를 노출하지 않는 `/api/v1/search` 응답
-- OpenAI/Disabled/Fake `GenerationGateway`와 API Key 없는 기본 부팅
-- `[S1]` 형식의 Context 조립, 실제 Retrieval Source의 별도 반환
-- 근거 없는 질문의 생성 호출 생략과 결정적인 거절 응답
-- 빈 답변·인용 누락·존재하지 않는 Source ID의 엄격한 검증
-- 생성 connect/read timeout, 단일 호출 정책과 token 사용량 반환
-- `/api/v1/answers`의 Testcontainers 기반 전체 파이프라인 통합 테스트
-
-Golden Query baseline 측정과 검색·RAG Custom Span 다음 순서는 threshold 및 Chunk Size × Top-K 실험입니다.
-
-## 검색·RAG Custom Span (7장)
-
-`/api/v1/search`와 `/api/v1/answers` 응답의 `X-Trace-Id`로 Grafana Tempo에서 요청을 찾을 수 있습니다. 검색의 Query Embedding·DB 검색, 답변의 Context 조립·Generation·인용 검증 시간이 각각 기록됩니다. 근거 부족은 `rag.outcome=no_evidence`로 표시되며 Generation Span을 만들지 않습니다.
-
-실행 요청은 `http/observability-lab.http`, Grafana 조회 방법과 무료 Fake 검증 명령은 [관측성 실습](docs/observability-lab.md)에 있습니다. tracing 비활성화 시 헤더와 Custom Span은 생략하며 Golden Query 평가 프로필은 계속 tracing을 끕니다. 질문·Prompt·원문·벡터·키·원래 예외 내용은 Span에 기록하지 않습니다.
-
-## Golden Query baseline (6장)
-
-검색 품질을 문서 수준으로 채점합니다. LLM 답변 품질 평가는 아닙니다.
-
-1. `evaluation/retrieval-golden-set.json`: 정답 파일명으로 고정한 15개 질문입니다. 문서마다 DIRECT 2개·PARAPHRASED 2개, UNRELATED 3개입니다. 힌트는 사람의 검토용이며 자동 채점에 사용하지 않습니다.
-2. `EvaluationMetrics`: Top-5 **Chunk 순위**를 유지하여 Hit@5와 MRR@5를 계산합니다. 같은 문서의 Chunk를 중복 제거하지 않습니다. 관련 없는 질문은 분모에서 제외합니다.
-3. `EvaluationCorpus` → `EvaluationRunner`: 기존 DB를 사전 검사한 후 `RetrievalService.search()`를 순차 호출합니다. 외부 호출을 감싸는 DB 트랜잭션은 없습니다.
-4. `EvaluationReport`: 실행별 고유 디렉터리에 결과와 재현 조건을 보관합니다. 중간 실패는 이후 호출을 중단하고 `INCOMPLETE`로 기록하며 최종 Hit/MRR은 발표하지 않습니다.
-
-### 실행
-
-Docker PostgreSQL을 실행하고 기존 lab의 세 문서가 Chunking/Embedding 모두 READY인지 확인합니다. `.env`에 활성 Embedding provider와 유효한 API Key가 필요합니다. 키를 명령행에 입력하지 마세요.
-
-```powershell
-# 사용법만 표시: API 호출 없음
-.\scripts\run-evaluation.ps1
-
-# 유료 Query Embedding 호출에 명시적으로 동의할 때 실행
-.\scripts\run-evaluation.ps1 -Live
-```
-
-Spring 서버는 따로 실행하지 않아도 됩니다. 전용 non-web `evaluation` 프로필이 Generation, Flyway, tracing을 끄고 실행 후 종료합니다. 정상 완료는 종료 코드 0, 사전 검사·검색·출력 실패는 비정상 종료입니다. 일반 부팅과 `mvn clean test`는 평가를 자동 실행하지 않습니다.
-
-- 조건: Top-K=5, minimum similarity=-1.0, 기존 cosine exact search.
-- 기존 600-token Chunk를 재사용합니다. **600이라는 생성 설정은 DB에 저장되어 있지 않으므로 운영자 확인 사항**이며, 보고서에 이 전제를 명시합니다. Chunk 수는 실제 DB에서 기록하며 13개로 강제하지 않습니다.
-- 세 파일명이 각각 유일하고 모든 Chunk가 현재 provider/model의 1536차원 벡터를 가져야 합니다. 추가 적격 문서가 있으면 baseline 오염을 막기 위해 중단합니다. 실행 중 업로드·삭제·재처리를 하지 마세요.
-- 정상 실행은 논리 검색 호출 15회입니다. 재임베딩·LLM·워밍업·자동 재시도는 없습니다.
-
-### 결과 읽기
-
-`evaluation/results/<timestamp>-<runId>/`에 `queries.csv`, `hits.csv`, `summary.md`가 생성됩니다. Git commit/dirty, 데이터셋 SHA-256, 문서 ID·원문 해시·Chunk 수, 모델과 검색 조건을 함께 남깁니다. 결과 디렉터리는 Git에서 제외됩니다. 포트폴리오에 게시할 결과는 검토한 뒤 별도로 보관하세요.
-
-- **Hit@5**: 관련 질문 12개 중 정답 문서의 Chunk가 Top-5에 한 번이라도 등장한 비율.
-- **MRR@5**: 첫 정답 Chunk의 순위가 1위면 1, 3위면 1/3, 없으면 0인 점수의 평균.
-- **p50/p95**: 성공 요청의 Query Embedding + DB 검색 시간에 nearest-rank 적용. HTTP·LLM·파일 출력은 제외하며, 작은 표본의 탐색적 측정이지 부하 테스트가 아닙니다.
-- `REVIEW_RANK`/`MISS` 행은 원문과 `relevantChunkHint`를 참고하여 검토합니다. 문서가 맞아도 해당 Chunk에 충분한 근거가 있다는 보장은 없습니다.
-- UNRELATED는 Hit/RR을 비워 두고 최고 similarity와 결과 수를 관찰합니다. threshold=-1에서는 빈 결과를 기대하지 않습니다.
-- 낮은 점수도 그대로 baseline으로 보관합니다. 질문/정답을 변경할 때는 원본을 보존하고 새 데이터셋 버전으로 기록하세요. 해시는 변경 식별에 사용됩니다.
-
-사전 검사 실패 코드: `EMBEDDING_DISABLED`(설정), `CORPUS_MISSING_OR_DUPLICATE_FILENAME`(파일명), `CORPUS_NOT_READY_OR_MODEL_MISMATCH`(상태·Chunk·벡터), `EXTRA_ELIGIBLE_DOCUMENTS`(추가 검색 대상). 원문·벡터·키·provider 내부 오류는 보고서에 기록하지 않습니다.
-
-자동 테스트는 Fake Gateway와 별도 Testcontainers DB로 검증합니다. 실제 baseline 완료는 사용자가 `-Live`로 15개 결과를 생성한 뒤 판정합니다. threshold 비교·LLM 평가·Custom Span·Frontend 및 RAG Prompt Injection 수동 검증은 이번 범위에 포함되지 않습니다.
-
-## 저장된 Baseline Threshold 비교 (8-1장)
-
-```powershell
-.\scripts\compare-thresholds.ps1 -BaselineDir "evaluation/results/<기존 실행 디렉터리>"
-```
-
-Spring·Docker·DB·API Key 없이 Java 21로 저장된 결과만 분석합니다. 최초 Maven 의존성 준비에는 인터넷이 필요할 수 있지만 OpenAI 호출은 없습니다. 경로는 명령을 실행한 위치 기준이며 필수입니다. `.env`를 읽거나 현재 RAG threshold를 변경하지 않습니다.
-
-입력은 `summary.md`, `queries.csv`, `hits.csv`입니다. COMPLETE·Top-K=5·threshold=-1.0·관련 12개/무관 3개의 정상 baseline만 받습니다. 손상된 CSV, 누락 메타데이터, 중복 ID, 비정상 순위·점수·결과 수는 실행 전에 거부합니다. 정답 파일명은 입력 실행 기록에서 가져옵니다.
-
-threshold `-1.0 / 0.3 / 0.4 / 0.5 / 0.7`에서 Hit@5·MRR@5·관련 질문 빈 결과율·무관 질문 결과 반환율·평균 Chunk 수를 비교합니다. 같은 문서의 여러 Chunk도 순위에 그대로 남습니다. 기준 점수와 같으면 포함합니다.
-
-출력은 `evaluation/results/threshold-comparison-<timestamp>-<runId>/`에 보관합니다.
-
-- `comparison.csv`: 조건별 지표와 분모
-- `query-comparison.csv`: 15개 질문 × 5개 조건, 정답 누락과 빈 결과 구분
-- `summary.md`: 비교표·탈락 질문·입력 파일 해시·원래 실행 조건·비교 도구 Git 상태
-
-정상 종료 코드는 0, 입력·출력 실패는 비정상 종료입니다. 성공 summary는 모든 결과를 쓴 뒤 생성합니다. 원본과 이전 실행 결과는 덮어쓰지 않습니다. 보고서 디렉터리는 기존처럼 Git에서 제외합니다.
-
-현재 저장된 baseline 재분석 결과: threshold 0.3에서는 Hit@5=1.0, MRR@5=0.875를 유지하며 무관 질문 3개가 모두 빈 결과입니다. 0.4는 Hit@5=0.75, 0.5는 0.5, 0.7은 약 0.0833입니다. 0.4에서 DEPLOY-004는 다른 문서가 남지만 정답은 사라집니다. 결과가 비지 않았다는 사실만으로 검색 성공으로 판정하지 않습니다.
-
-이는 기존 Top-5의 더 높은 threshold에 대한 재분석입니다. Top-K를 늘리거나 새로운 순위·지연시간을 측정하지 않습니다. 후보를 선택한 뒤 새로운 질문으로 검증해야 하며 자동으로 최적값을 확정하지 않습니다.
-
-관련 테스트: `ThresholdComparisonTests` (개발 DB와 실제 baseline 파일에 의존하지 않는 생성 fixture 사용).
-# 새 질문으로 Threshold 후보 검증
-
-18개 고정 질문의 무료 사전 검증, 별도 유료 평가(Embedding 18회), 저장 결과 재채점 절차는 [threshold 검증 안내](docs/threshold-validation.md)를 참고하세요. 기존 15개 baseline과 RAG threshold 0.5는 유지합니다.
+~~~
+
+- API health: http://localhost:8080/actuator/health
+- Grafana: http://localhost:3000
+- Tempo API: http://localhost:3200
+
+기본 .env.example은 Embedding과 Chat provider가 none이므로 외부 AI 호출이 발생하지 않습니다. 실제 검색에는 SPRING_AI_MODEL_EMBEDDING=openai, 답변 생성에는 SPRING_AI_MODEL_CHAT=openai와 유효한 OPENAI_API_KEY가 필요합니다. 키는 커밋하지 않습니다.
+
+Frontend는 별도 터미널에서 실행합니다.
+
+~~~powershell
+Set-Location frontend
+npm ci
+npm run dev
+~~~
+
+## 주요 API
+
+| Method | Endpoint | 역할 |
+|---|---|---|
+| POST | /api/v1/documents | TXT/Markdown 업로드 |
+| POST | /api/v1/documents/{id}/process | Chunking 실행 |
+| POST | /api/v1/documents/{id}/embeddings | Chunk Embedding 실행 |
+| GET | /api/v1/documents/{id}/chunks | Chunk와 embedding 여부 조회 |
+| POST | /api/v1/search | query embedding과 vector search |
+| POST | /api/v1/answers | Retrieval, context 구성, 생성, citation 검증 |
+
+단계별 수동 검증 요청은 [http directory](http), 전체 흐름은 [retrieval lab](docs/retrieval-lab-results.md)에서 실행할 수 있습니다.
+
+## 한계와 다음 과제
+
+- 평가 corpus가 3개 문서, 18개 질문으로 작고 특정 운영 문서 도메인에 한정됩니다.
+- relevantChunkHint는 데이터셋에 있지만 현재 평가는 document-level Hit/MRR만 계산합니다.
+- 답변 factuality, citation entailment, LLM-as-a-judge 평가는 없습니다.
+- hard negative를 충분히 제거하면서 관련 검색을 유지하는 threshold를 아직 찾지 못했습니다.
+- exact scan만 사용하며 ANN index, hybrid search, reranker, metadata filter를 구현하지 않았습니다.
+- TXT/Markdown만 지원하며 PDF, HTML, OCR은 지원하지 않습니다.
+- 인증, 권한, tenant 분리, rate limit, 비동기 queue, DLQ가 없습니다.
+- 처리 중 프로세스가 종료된 경우 PROCESSING 상태를 회수하는 lease/reaper가 없습니다.
+- OpenTelemetry는 답변·검색 경로 중심이며 ingestion custom span, metrics, logs, dashboard, alert가 없습니다.
+- CI/CD, Dockerfile 기반 애플리케이션 배포, 부하 테스트는 아직 없습니다.
+
+## 더 자세한 문서
+
+- [Repository 구현 감사](docs/PORTFOLIO_AUDIT.md)
+- [포트폴리오 구성 계획](docs/PORTFOLIO_PLAN.md)
+- [Frontend demo와 상태 구분](docs/frontend-demo.md)
+- [RAG 실습 기록](docs/rag-lab-results.md)
+- [Observability 실습](docs/observability-lab.md)

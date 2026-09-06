@@ -32,8 +32,10 @@ Tempo 보존 기간은 현재 24시간입니다. 포트폴리오 증거는 Trace
 
 | 시나리오 | Trace ID | 확인 사항 |
 |---|---|---|
-| 정상 답변 | `5f52ee9246ccd0dc3f7f1a70dc6ea8dc` | 2026-09-05 Fake 검증: 7개 Custom Span, 올바른 부모 관계 |
-| 근거 부족 | `aa85851b9a81c2c13903be7c64f9cde1` | 2026-09-05 Fake 검증: 생성 생략, no_evidence |
+| 정상 답변 | `868deea27bbe0ec34e6a73583f11847e` | 2026-09-06 Fake 검증: 전체 9개(unique 9), Custom Span 7개 |
+| 근거 부족 | `65dbdbb2aba9fd912e095799d8398912` | 2026-09-06 Fake 검증: 전체 6개(unique 6), 생성 Span 없음 |
 | 오류 | | 실패 구간·안전한 오류 코드 |
+
+실행 환경과 Span 이름은 [OpenTelemetry live path 검증 기록](evidence/observability-verification-2026-09-06.md)에 고정해 두었습니다. 위 Trace ID 자체는 24시간 retention 이후 Tempo에서 조회되지 않을 수 있습니다.
 
 서버 종료는 Ctrl+C로 수행하여 graceful shutdown 로그를 확인합니다. 현재 RAG threshold 0.5는 유지하며 검색 품질 튜닝은 후속 평가에서 진행합니다.
