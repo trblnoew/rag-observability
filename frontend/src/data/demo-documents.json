@@ -1,0 +1,160 @@
+[ {
+  "id" : 1,
+  "title" : "cpu-spike",
+  "originalFilename" : "cpu-spike.md",
+  "content" : "# 컨테이너 CPU 사용률 급증 대응 Runbook\n\n## 문서 목적\n\n이 문서는 컨테이너 기반 Spring Boot 서비스의 CPU 사용률이 급증하고 처리량이 떨어질 때 원인을 분류하는 절차다. 높은 CPU는 항상 애플리케이션 코드가 계산을 많이 했다는 뜻은 아니다. 컨테이너가 CPU limit에 막혀 throttling 되는 경우, JVM의 GC가 반복되는 경우, 특정 스레드가 무한 반복하는 경우와 정상적인 트래픽 증가를 구분해야 한다. 대응자는 평균 CPU 그래프 하나만 보지 말고 사용량, 제한량, throttled time, 요청량과 지연 시간을 같은 구간에서 비교한다.\n\n## 현상 분류\n\n먼저 장애가 단일 pod에만 나타나는지 전체 replica에 동시에 나타나는지 확인한다. 단일 pod만 비정상이라면 특정 요청, 로컬 캐시 상태, 비정상 스레드 또는 노드 자원 경합 가능성이 높다. 모든 pod가 비슷하게 상승했다면 트래픽 변화, 공통 배포, 외부 응답 변화 또는 전체 용량 부족을 의심한다. 배포 버전과 설정 hash가 pod마다 같은지도 확인해 서로 다른 바이너리가 섞인 상황을 배제한다.\n\n컨테이너 CPU usage가 limit에 가까운지와 CFS throttling 지표가 증가하는지를 확인한다. CPU limit이 1 core인데 애플리케이션이 2 core 분량의 작업을 요구하면 사용률은 제한 안에 보이더라도 실행 시간이 반복적으로 잘릴 수 있다. 이때 요청 latency는 늘고 처리량은 줄며 throttled periods가 증가한다. 단순히 JVM 프로세스의 CPU 백분율만 보면 이 차이를 놓칠 수 있으므로 Kubernetes request와 limit, 노드의 실제 여유까지 함께 본다.\n\n## 트래픽과 런타임 확인\n\n요청 수가 CPU와 함께 증가했다면 엔드포인트별 RPS와 처리 비용을 비교한다. 전체 요청 수는 비슷해도 대용량 payload나 비싼 검색 요청 비율이 늘면 CPU가 상승할 수 있다. 오류를 만난 클라이언트가 빠르게 재시도하는지도 확인한다. 재시도 폭풍은 동일 작업을 여러 번 실행해 CPU를 소모하고 downstream에 추가 부하를 전달하므로 rate limit과 backoff 상태를 점검한다.\n\nJVM에서는 heap 사용량, allocation rate, young GC 횟수, full GC 시간과 pause를 확인한다. CPU 상승 구간에 allocation rate와 GC CPU가 함께 증가하면 객체 생성이 지나치게 많은 코드나 heap 압박 가능성이 있다. full GC가 반복되는데 회수 후 사용량이 거의 줄지 않으면 메모리 보유 경로를 조사해야 한다. 반대로 GC 지표가 안정적이면 hot method, 직렬화, 압축, 암호화 또는 busy loop 같은 순수 계산 경로를 우선 조사한다.\n\n## Thread dump와 프로파일링\n\n증상이 지속되는 동안 수 초 간격으로 thread dump를 최소 세 번 수집한다. 한 번의 dump는 우연히 실행 중인 스레드만 보여줄 수 있지만 여러 dump에서 같은 stack이 RUNNABLE 상태로 반복되면 CPU hot path 후보가 된다. 동일 스레드 이름과 native thread id를 OS 또는 컨테이너의 CPU 사용 상위 스레드와 연결한다. 민감한 요청 데이터가 stack이나 로컬 변수에 포함될 수 있으므로 dump 파일은 접근이 제한된 위치에 보관한다.\n\n여러 dump에서 JSON 직렬화, 정규식, 압축, 암호화 또는 특정 반복문이 계속 상단에 보이는지 확인한다. lock을 기다리는 BLOCKED 스레드가 많다면 CPU 문제처럼 보이지만 실제 병목은 동기화 경합일 수 있다. RUNNABLE 스레드 수가 core 수보다 지나치게 많으면 context switching 비용도 커질 수 있다. 짧은 프로파일링이 허용되면 Java Flight Recorder나 async-profiler로 CPU sample을 수집하되 운영 부하와 수집 시간을 제한한다.\n\n## 안전한 완화\n\n트래픽 증가가 원인이고 새 replica가 정상적으로 준비될 수 있다면 수평 확장을 검토한다. 그러나 CPU limit이 너무 낮은 상태에서 replica만 늘리면 각 pod가 같은 throttling을 겪을 수 있다. 반대로 노드 전체가 포화라면 pod 확장이 스케줄링되더라도 실제 CPU를 얻지 못한다. request와 limit 변경은 배포 정책과 클러스터 용량을 확인한 뒤 작은 단계로 수행한다.\n\n특정 기능이나 엔드포인트가 원인이라면 기능 플래그, 동시성 제한 또는 임시 rate limit으로 부하를 격리한다. 문제가 시작된 배포가 명확하고 이전 버전이 데이터 스키마와 호환된다면 rollback을 선택한다. 프로세스 재시작은 hot loop를 잠시 제거할 수 있지만 원인을 숨길 수 있으므로, 재시작 전에 가능한 범위에서 thread dump와 주요 지표를 확보한다. 무제한 자동 재시작은 증거를 잃고 동일 장애를 반복할 위험이 있다.\n\n## 복구 확인과 사후 조치\n\n복구는 CPU 사용률만 낮아진 것으로 판단하지 않는다. throttled time이 정상 범위로 돌아오고 요청 처리량, p95 latency, 오류율이 함께 회복돼야 한다. GC pause와 allocation rate, runnable thread 수가 안정화됐는지 확인한다. replica를 늘렸다면 scale-in 뒤에도 동일 부하를 감당할 수 있는지 또는 새 기준 용량을 유지할지 결정한다.\n\n사후 분석에는 CPU usage와 limit, throttling 비율, pod와 노드 범위, 요청량 변화, GC 지표와 반복된 thread stack을 포함한다. 코드 수정이 필요하면 동일 입력을 재현하는 부하 테스트와 profiler 결과를 함께 남긴다. 경보는 CPU 평균값 하나보다 throttling, latency와 오류율을 결합해 구성한다. 최종적으로 CPU 급증은 애플리케이션 계산, JVM 메모리 관리, 컨테이너 제한과 트래픽 형태를 분리해 진단해야 재발 방지책을 정확히 선택할 수 있다.\n",
+  "contentSha256" : "d6afff35a4cbcc4fe7d3625665c01f84544efe0e9ff899c28dbc1a5374524ef8",
+  "status" : "READY",
+  "embeddingStatus" : "READY",
+  "sourceType" : "MARKDOWN",
+  "retryCount" : 0,
+  "embeddingRetryCount" : 0,
+  "createdAt" : "2026-09-05T00:00:00Z",
+  "updatedAt" : "2026-09-05T00:00:00Z",
+  "chunks" : [ {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 100,
+    "embedded" : true,
+    "content" : "# 컨테이너 CPU 사용률 급증 대응 Runbook\n\n## 문서 목적\n\n이 문서는 컨테이너 기반 Spring Boot 서비스의 CPU 사용률이 급증하고 처리량이 떨어질 때 원인을 분류하는 절차다. 높은 CPU는 항상 애플리케이션 코드가 계산을 많이 했다는 뜻은 아니다. 컨테이너가 CPU limit에 막혀 throttling 되는 경우, JVM의 GC가 반복되는 경우, 특정 스레드가 무한 반복하는 경우와 정상적인 트래픽 증가를 구분해야 한다. 대응자는 평균 CPU 그래프 하나만 보지 말고 사용량, 제한량, throttled time, 요청량과 지연 시간을 같은 구간에서 비교한다.\n\n## 현상 분류\n\n먼저 장애가 단일 pod에만 나타나는지 전체 replica에 동시에 나타나는지 확인한다. 단일 pod만 비정상이라면 특정 요청, 로컬 캐시 상태, 비정상 스레드 또는 노드 자원 경합 가능성이 높다. 모든 pod가 비슷하게 상승했다면 트래픽 변화, 공통 배포, 외부 응답 변화 또는 전체 용량 부족을 의심한다. 배포 버전과 설정 hash가 pod마다 같은지도 확인해 서로 다른 바이너리가 섞인 상황을 배제한다.\n\n컨테이너 CPU usage가 limit에 가까운지와 CFS throttling 지표가 증가하는지를 확인한다. CPU limit이 1 core인데 애플리케이션이 2 core 분량의 작업을 요구하면 사용률은 제한 안에 보이더라도 실행 시간이 반복적으로 잘릴 수 있다. 이때 요청 latency는 늘고 처리량은 줄며 throttled periods가 증가한다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 595,
+    "chunkIndex" : 0,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 101,
+    "embedded" : true,
+    "content" : "단순히 JVM 프로세스의 CPU 백분율만 보면 이 차이를 놓칠 수 있으므로 Kubernetes request와 limit, 노드의 실제 여유까지 함께 본다.\n\n## 트래픽과 런타임 확인\n\n요청 수가 CPU와 함께 증가했다면 엔드포인트별 RPS와 처리 비용을 비교한다. 전체 요청 수는 비슷해도 대용량 payload나 비싼 검색 요청 비율이 늘면 CPU가 상승할 수 있다. 오류를 만난 클라이언트가 빠르게 재시도하는지도 확인한다. 재시도 폭풍은 동일 작업을 여러 번 실행해 CPU를 소모하고 downstream에 추가 부하를 전달하므로 rate limit과 backoff 상태를 점검한다.\n\nJVM에서는 heap 사용량, allocation rate, young GC 횟수, full GC 시간과 pause를 확인한다. CPU 상승 구간에 allocation rate와 GC CPU가 함께 증가하면 객체 생성이 지나치게 많은 코드나 heap 압박 가능성이 있다. full GC가 반복되는데 회수 후 사용량이 거의 줄지 않으면 메모리 보유 경로를 조사해야 한다. 반대로 GC 지표가 안정적이면 hot method, 직렬화, 압축, 암호화 또는 busy loop 같은 순수 계산 경로를 우선 조사한다.\n\n## Thread dump와 프로파일링\n\n증상이 지속되는 동안 수 초 간격으로 thread dump를 최소 세 번 수집한다. 한 번의 dump는 우연히 실행 중인 스레드만 보여줄 수 있지만 여러 dump에서 같은 stack이 RUNNABLE 상태로 반복되면 CPU hot path 후보가 된다. 동일 스레드 이름과 native thread id를 OS 또는 컨테이너의 CPU 사용 상위 스레드와 연결한다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 566,
+    "chunkIndex" : 1,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 102,
+    "embedded" : true,
+    "content" : "민감한 요청 데이터가 stack이나 로컬 변수에 포함될 수 있으므로 dump 파일은 접근이 제한된 위치에 보관한다.\n\n여러 dump에서 JSON 직렬화, 정규식, 압축, 암호화 또는 특정 반복문이 계속 상단에 보이는지 확인한다. lock을 기다리는 BLOCKED 스레드가 많다면 CPU 문제처럼 보이지만 실제 병목은 동기화 경합일 수 있다. RUNNABLE 스레드 수가 core 수보다 지나치게 많으면 context switching 비용도 커질 수 있다. 짧은 프로파일링이 허용되면 Java Flight Recorder나 async-profiler로 CPU sample을 수집하되 운영 부하와 수집 시간을 제한한다.\n\n## 안전한 완화\n\n트래픽 증가가 원인이고 새 replica가 정상적으로 준비될 수 있다면 수평 확장을 검토한다. 그러나 CPU limit이 너무 낮은 상태에서 replica만 늘리면 각 pod가 같은 throttling을 겪을 수 있다. 반대로 노드 전체가 포화라면 pod 확장이 스케줄링되더라도 실제 CPU를 얻지 못한다. request와 limit 변경은 배포 정책과 클러스터 용량을 확인한 뒤 작은 단계로 수행한다.\n\n특정 기능이나 엔드포인트가 원인이라면 기능 플래그, 동시성 제한 또는 임시 rate limit으로 부하를 격리한다. 문제가 시작된 배포가 명확하고 이전 버전이 데이터 스키마와 호환된다면 rollback을 선택한다. 프로세스 재시작은 hot loop를 잠시 제거할 수 있지만 원인을 숨길 수 있으므로, 재시작 전에 가능한 범위에서 thread dump와 주요 지표를 확보한다. 무제한 자동 재시작은 증거를 잃고 동일 장애를 반복할 위험이 있다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 596,
+    "chunkIndex" : 2,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 103,
+    "embedded" : true,
+    "content" : "## 복구 확인과 사후 조치\n\n복구는 CPU 사용률만 낮아진 것으로 판단하지 않는다. throttled time이 정상 범위로 돌아오고 요청 처리량, p95 latency, 오류율이 함께 회복돼야 한다. GC pause와 allocation rate, runnable thread 수가 안정화됐는지 확인한다. replica를 늘렸다면 scale-in 뒤에도 동일 부하를 감당할 수 있는지 또는 새 기준 용량을 유지할지 결정한다.\n\n사후 분석에는 CPU usage와 limit, throttling 비율, pod와 노드 범위, 요청량 변화, GC 지표와 반복된 thread stack을 포함한다. 코드 수정이 필요하면 동일 입력을 재현하는 부하 테스트와 profiler 결과를 함께 남긴다. 경보는 CPU 평균값 하나보다 throttling, latency와 오류율을 결합해 구성한다. 최종적으로 CPU 급증은 애플리케이션 계산, JVM 메모리 관리, 컨테이너 제한과 트래픽 형태를 분리해 진단해야 재발 방지책을 정확히 선택할 수 있다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 356,
+    "chunkIndex" : 3,
+    "embeddingModel" : "illustration"
+  } ]
+}, {
+  "id" : 2,
+  "title" : "db-connection-timeout",
+  "originalFilename" : "db-connection-timeout.md",
+  "content" : "# DB Connection Timeout 대응 Runbook\n\n## 문서 목적\n\n이 문서는 트래픽이 증가한 뒤 애플리케이션에서 `connection timeout`이 발생할 때 원인을 좁히고 안전하게 복구하기 위한 운영 절차다. 여기서 timeout은 SQL 실행 시간이 길다는 뜻과 같지 않다. 애플리케이션이 HikariCP 풀에서 정해진 시간 안에 사용할 수 있는 DB 연결을 빌리지 못했다는 뜻일 수 있으므로, 먼저 연결 획득 단계와 SQL 실행 단계를 분리해서 본다. 장애 대응자는 에러 한 줄만 보고 풀 크기를 바로 늘리지 말고 애플리케이션 풀, PostgreSQL 연결 제한, 장기 트랜잭션을 같은 시간축에서 확인해야 한다.\n\n## 최초 5분 확인\n\n첫 번째로 HikariCP의 `active`, `idle`, `pending`, `max` 지표를 확인한다. `active`가 `max`에 붙어 있고 `pending`이 계속 증가하며 `idle`이 0이라면, 모든 연결이 사용 중이어서 새 요청이 기다리는 풀 고갈 가능성이 높다. 반대로 풀에 `idle` 연결이 남아 있는데도 timeout이 난다면 네트워크 단절, 인증 실패, DNS 문제 또는 DB 측 신규 연결 거부를 의심한다. 한 인스턴스만 보지 말고 동일 버전으로 실행 중인 모든 애플리케이션 인스턴스의 풀 지표를 합산해야 한다.\n\n같은 시각의 요청량, 오류율, p95 응답 시간과 배포 이벤트도 함께 본다. 갑작스러운 트래픽 증가 없이 배포 직후 문제가 시작됐다면 커넥션을 닫지 않는 코드, 트랜잭션 범위 확대, 새로 추가한 느린 쿼리를 우선 의심한다. 트래픽과 함께 선형으로 증가했다면 현재 동시성에 비해 풀이 작거나 DB 처리량이 부족할 수 있다. 그러나 풀 크기 확대는 DB가 수용할 수 있는 총 연결 수를 계산한 뒤에만 수행한다.\n\n## PostgreSQL 연결 여유 계산\n\nPostgreSQL의 `max_connections`에서 운영자 접속, 마이그레이션, 모니터링과 관리 작업용 여유분을 제외한 값이 애플리케이션 전체가 사용할 수 있는 상한이다. 예를 들어 DB가 200개 연결을 허용하고 30개를 관리용으로 남긴다면 애플리케이션 예산은 170개다. 애플리케이션 인스턴스가 10개이고 각 HikariCP `maximumPoolSize`가 20이면 이론상 200개를 요구하므로 이미 예산을 넘는다. 오토스케일링으로 인스턴스가 늘어날 때도 `인스턴스 수 × 인스턴스별 max pool` 계산을 다시 해야 한다.\n\n`pg_stat_activity`에서 현재 연결 수를 상태별로 집계하고 `active`, `idle`, `idle in transaction`을 구분한다. `idle in transaction`이 오래 유지되는 세션은 트랜잭션을 시작한 뒤 커밋이나 롤백을 하지 않은 요청일 수 있다. 이런 장기 트랜잭션은 연결 하나를 계속 점유할 뿐 아니라 vacuum 진행과 row version 정리를 방해할 수 있다. 단순히 세션을 종료하기 전에 어떤 애플리케이션, 사용자, 쿼리와 요청에서 만들어졌는지 식별하고 영향 범위를 기록한다.\n\n## 장기 실행 쿼리와 누수 조사\n\n연결이 모두 `active`라면 각 세션의 `query_start`, `state_change`, `wait_event_type`, `wait_event`를 확인한다. CPU를 사용하며 오래 실행되는 쿼리와 lock을 기다리며 멈춘 쿼리는 해결 방식이 다르다. lock 대기라면 blocking session과 blocked session 관계를 찾아 선행 트랜잭션이 왜 끝나지 않았는지 조사한다. 실행 계획 악화라면 최근 통계 변경, 인덱스 사용 여부, 반환 행 수 증가를 확인하되 장애 중 무리한 인덱스 생성은 피한다.\n\n애플리케이션에서는 모든 JDBC 사용 경로가 try-with-resources 또는 Spring 트랜잭션 경계 안에서 정상 반환되는지 확인한다. 외부 HTTP 호출을 DB 트랜잭션 안에서 기다리는 코드는 외부 서비스 지연만큼 연결을 점유하므로 특히 위험하다. 파일 처리, 대규모 반복문, 사용자 입력 대기 역시 트랜잭션 밖으로 분리한다. HikariCP leak detection 로그는 의심 경로를 찾는 보조 자료이며, 너무 낮은 임계값은 정상 장기 요청도 누수처럼 보이게 하므로 실제 SLA보다 충분히 크게 설정한다.\n\n## 안전한 완화 순서\n\n우선 신규 부하를 줄이기 위해 과도한 재시도와 동시 요청을 제한한다. timeout을 만난 모든 요청이 즉시 재시도하면 이미 가득 찬 풀에 더 많은 대기자를 만들어 장애를 증폭시킨다. 재시도가 필요하다면 제한된 횟수, 지수 backoff와 jitter를 적용하고 멱등성이 보장된 작업에만 사용한다. 읽기 트래픽을 줄일 수 있는 기능 플래그나 임시 rate limit이 있다면 사용자 영향과 함께 검토한다.\n\n명확한 blocking transaction이 있고 종료 영향이 확인됐을 때만 해당 세션 취소 또는 종료를 선택한다. 풀 크기를 임시로 늘릴 때는 DB 연결 예산과 CPU, 메모리 여유를 동시에 확인한다. DB가 이미 CPU 포화 상태라면 연결 수를 늘리는 조치는 대기 쿼리만 늘려 전체 지연을 악화시킬 수 있다. 장애 완화 뒤에는 임시 설정을 영구값으로 남기지 말고 원래 값과 변경 시각을 기록한다.\n\n## 복구 확인과 사후 조치\n\n복구 판단은 단순히 오류가 사라진 순간이 아니라 HikariCP `pending`이 0 근처로 내려가고 `idle` 연결이 회복되며 p95 지연이 정상 범위로 돌아온 상태로 한다. PostgreSQL의 총 연결 수가 운영 예산 아래인지, 장기 트랜잭션과 lock 대기가 제거됐는지도 확인한다. 최소 15분 동안 재발하지 않는지 관찰하고 트래픽 변화가 없었는지 함께 기록한다.\n\n사후 분석에는 장애 시작과 종료 시각, 최초 증상, HikariCP active/max 비율, PostgreSQL 연결 수, 가장 오래된 트랜잭션, 배포 여부와 완화 조치를 포함한다. 재발 방지를 위해 풀 대기자 수, connection acquisition latency, `idle in transaction` 지속 시간에 경보를 둔다. 용량 계획에는 최대 인스턴스 수를 사용해 전체 풀 상한을 계산하고, DB 관리 연결을 위한 여유분을 명시한다. 최종적으로 연결 timeout은 풀 설정 하나의 문제가 아니라 요청 동시성, 트랜잭션 수명, 쿼리 처리량과 DB 연결 예산이 만나는 지점의 문제로 다룬다.\n",
+  "contentSha256" : "44b2d1cc8fc82bb7115d1091f1ce6dead98158bd0d9a5a33740d40893d96c925",
+  "status" : "READY",
+  "embeddingStatus" : "READY",
+  "sourceType" : "MARKDOWN",
+  "retryCount" : 0,
+  "embeddingRetryCount" : 0,
+  "createdAt" : "2026-09-05T00:00:00Z",
+  "updatedAt" : "2026-09-05T00:00:00Z",
+  "chunks" : [ {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 200,
+    "embedded" : true,
+    "content" : "# DB Connection Timeout 대응 Runbook\n\n## 문서 목적\n\n이 문서는 트래픽이 증가한 뒤 애플리케이션에서 `connection timeout`이 발생할 때 원인을 좁히고 안전하게 복구하기 위한 운영 절차다. 여기서 timeout은 SQL 실행 시간이 길다는 뜻과 같지 않다. 애플리케이션이 HikariCP 풀에서 정해진 시간 안에 사용할 수 있는 DB 연결을 빌리지 못했다는 뜻일 수 있으므로, 먼저 연결 획득 단계와 SQL 실행 단계를 분리해서 본다. 장애 대응자는 에러 한 줄만 보고 풀 크기를 바로 늘리지 말고 애플리케이션 풀, PostgreSQL 연결 제한, 장기 트랜잭션을 같은 시간축에서 확인해야 한다.\n\n## 최초 5분 확인\n\n첫 번째로 HikariCP의 `active`, `idle`, `pending`, `max` 지표를 확인한다. `active`가 `max`에 붙어 있고 `pending`이 계속 증가하며 `idle`이 0이라면, 모든 연결이 사용 중이어서 새 요청이 기다리는 풀 고갈 가능성이 높다. 반대로 풀에 `idle` 연결이 남아 있는데도 timeout이 난다면 네트워크 단절, 인증 실패, DNS 문제 또는 DB 측 신규 연결 거부를 의심한다. 한 인스턴스만 보지 말고 동일 버전으로 실행 중인 모든 애플리케이션 인스턴스의 풀 지표를 합산해야 한다.\n\n같은 시각의 요청량, 오류율, p95 응답 시간과 배포 이벤트도 함께 본다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 554,
+    "chunkIndex" : 0,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 201,
+    "embedded" : true,
+    "content" : "갑작스러운 트래픽 증가 없이 배포 직후 문제가 시작됐다면 커넥션을 닫지 않는 코드, 트랜잭션 범위 확대, 새로 추가한 느린 쿼리를 우선 의심한다. 트래픽과 함께 선형으로 증가했다면 현재 동시성에 비해 풀이 작거나 DB 처리량이 부족할 수 있다. 그러나 풀 크기 확대는 DB가 수용할 수 있는 총 연결 수를 계산한 뒤에만 수행한다.\n\n## PostgreSQL 연결 여유 계산\n\nPostgreSQL의 `max_connections`에서 운영자 접속, 마이그레이션, 모니터링과 관리 작업용 여유분을 제외한 값이 애플리케이션 전체가 사용할 수 있는 상한이다. 예를 들어 DB가 200개 연결을 허용하고 30개를 관리용으로 남긴다면 애플리케이션 예산은 170개다. 애플리케이션 인스턴스가 10개이고 각 HikariCP `maximumPoolSize`가 20이면 이론상 200개를 요구하므로 이미 예산을 넘는다. 오토스케일링으로 인스턴스가 늘어날 때도 `인스턴스 수 × 인스턴스별 max pool` 계산을 다시 해야 한다.\n\n`pg_stat_activity`에서 현재 연결 수를 상태별로 집계하고 `active`, `idle`, `idle in transaction`을 구분한다. `idle in transaction`이 오래 유지되는 세션은 트랜잭션을 시작한 뒤 커밋이나 롤백을 하지 않은 요청일 수 있다. 이런 장기 트랜잭션은 연결 하나를 계속 점유할 뿐 아니라 vacuum 진행과 row version 정리를 방해할 수 있다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 568,
+    "chunkIndex" : 1,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 202,
+    "embedded" : true,
+    "content" : "단순히 세션을 종료하기 전에 어떤 애플리케이션, 사용자, 쿼리와 요청에서 만들어졌는지 식별하고 영향 범위를 기록한다.\n\n## 장기 실행 쿼리와 누수 조사\n\n연결이 모두 `active`라면 각 세션의 `query_start`, `state_change`, `wait_event_type`, `wait_event`를 확인한다. CPU를 사용하며 오래 실행되는 쿼리와 lock을 기다리며 멈춘 쿼리는 해결 방식이 다르다. lock 대기라면 blocking session과 blocked session 관계를 찾아 선행 트랜잭션이 왜 끝나지 않았는지 조사한다. 실행 계획 악화라면 최근 통계 변경, 인덱스 사용 여부, 반환 행 수 증가를 확인하되 장애 중 무리한 인덱스 생성은 피한다.\n\n애플리케이션에서는 모든 JDBC 사용 경로가 try-with-resources 또는 Spring 트랜잭션 경계 안에서 정상 반환되는지 확인한다. 외부 HTTP 호출을 DB 트랜잭션 안에서 기다리는 코드는 외부 서비스 지연만큼 연결을 점유하므로 특히 위험하다. 파일 처리, 대규모 반복문, 사용자 입력 대기 역시 트랜잭션 밖으로 분리한다. HikariCP leak detection 로그는 의심 경로를 찾는 보조 자료이며, 너무 낮은 임계값은 정상 장기 요청도 누수처럼 보이게 하므로 실제 SLA보다 충분히 크게 설정한다.\n\n## 안전한 완화 순서\n\n우선 신규 부하를 줄이기 위해 과도한 재시도와 동시 요청을 제한한다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 548,
+    "chunkIndex" : 2,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 203,
+    "embedded" : true,
+    "content" : "timeout을 만난 모든 요청이 즉시 재시도하면 이미 가득 찬 풀에 더 많은 대기자를 만들어 장애를 증폭시킨다. 재시도가 필요하다면 제한된 횟수, 지수 backoff와 jitter를 적용하고 멱등성이 보장된 작업에만 사용한다. 읽기 트래픽을 줄일 수 있는 기능 플래그나 임시 rate limit이 있다면 사용자 영향과 함께 검토한다.\n\n명확한 blocking transaction이 있고 종료 영향이 확인됐을 때만 해당 세션 취소 또는 종료를 선택한다. 풀 크기를 임시로 늘릴 때는 DB 연결 예산과 CPU, 메모리 여유를 동시에 확인한다. DB가 이미 CPU 포화 상태라면 연결 수를 늘리는 조치는 대기 쿼리만 늘려 전체 지연을 악화시킬 수 있다. 장애 완화 뒤에는 임시 설정을 영구값으로 남기지 말고 원래 값과 변경 시각을 기록한다.\n\n## 복구 확인과 사후 조치\n\n복구 판단은 단순히 오류가 사라진 순간이 아니라 HikariCP `pending`이 0 근처로 내려가고 `idle` 연결이 회복되며 p95 지연이 정상 범위로 돌아온 상태로 한다. PostgreSQL의 총 연결 수가 운영 예산 아래인지, 장기 트랜잭션과 lock 대기가 제거됐는지도 확인한다. 최소 15분 동안 재발하지 않는지 관찰하고 트래픽 변화가 없었는지 함께 기록한다.\n\n사후 분석에는 장애 시작과 종료 시각, 최초 증상, HikariCP active/max 비율, PostgreSQL 연결 수, 가장 오래된 트랜잭션, 배포 여부와 완화 조치를 포함한다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 591,
+    "chunkIndex" : 3,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 204,
+    "embedded" : true,
+    "content" : "재발 방지를 위해 풀 대기자 수, connection acquisition latency, `idle in transaction` 지속 시간에 경보를 둔다. 용량 계획에는 최대 인스턴스 수를 사용해 전체 풀 상한을 계산하고, DB 관리 연결을 위한 여유분을 명시한다. 최종적으로 연결 timeout은 풀 설정 하나의 문제가 아니라 요청 동시성, 트랜잭션 수명, 쿼리 처리량과 DB 연결 예산이 만나는 지점의 문제로 다룬다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 161,
+    "chunkIndex" : 4,
+    "embeddingModel" : "illustration"
+  } ]
+}, {
+  "id" : 3,
+  "title" : "deployment-rollback",
+  "originalFilename" : "deployment-rollback.md",
+  "content" : "# 배포 실패와 Rollback 대응 Runbook\n\n## 문서 목적\n\n이 문서는 새 버전 배포 중 readiness 실패, 오류율 증가 또는 Flyway migration 문제를 발견했을 때 중단과 rollback을 결정하는 절차다. 배포 성공은 새 컨테이너 프로세스가 시작됐다는 뜻이 아니라 실제 요청을 받을 준비가 됐고 핵심 사용자 흐름이 정상이라는 뜻이다. 대응자는 liveness와 readiness를 구분하고, 애플리케이션 버전과 DB 스키마의 호환성을 확인한 뒤 복구 방법을 선택해야 한다.\n\n## 배포 중단 기준\n\ncanary 단계에서 새 버전의 오류율, p95 latency, readiness 성공률을 이전 버전과 비교한다. readiness probe가 반복 실패하거나 핵심 API의 5xx 비율이 사전 정의한 한도를 넘으면 추가 트래픽 전환을 즉시 멈춘다. 배포 도구의 진행률만 보지 말고 실제 load balancer가 새 pod에 어느 정도 트래픽을 전달했는지 확인한다. 오류가 새 버전에만 집중되면 canary weight를 0으로 낮추는 것이 가장 빠른 격리 수단이다.\n\nliveness probe 실패는 프로세스를 재시작시키지만 readiness probe 실패는 해당 인스턴스를 서비스 대상에서 제외한다. 시작 시간이 긴 애플리케이션에 liveness 임계값을 너무 짧게 두면 정상 초기화 중인 pod가 반복 재시작될 수 있다. 반대로 readiness가 DB 연결, 필수 migration 또는 캐시 준비를 충분히 반영하지 않으면 준비되지 않은 인스턴스가 사용자 요청을 받는다. probe 실패 이유와 애플리케이션 시작 로그를 함께 확인해 단순 시간 부족인지 실제 의존성 실패인지 분류한다.\n\n## Flyway와 DB 호환성\n\nFlyway validation 실패가 보이면 적용된 migration checksum과 애플리케이션에 포함된 migration 파일을 비교한다. 이미 운영 DB에 적용된 migration 파일을 수정해서 checksum을 맞추려 하지 않는다. 필요한 변경은 새로운 버전의 migration으로 추가하고, 누가 언제 어떤 환경에 적용했는지 기록한다. migration이 일부 환경에서만 적용됐다면 배포를 계속하기 전에 환경별 `flyway_schema_history` 상태를 확인한다.\n\nDB 스키마 변경이 완료된 뒤 애플리케이션만 이전 버전으로 rollback할 수 있는지 반드시 판단한다. 컬럼 삭제나 타입 변경처럼 이전 코드와 호환되지 않는 migration은 단순 애플리케이션 rollback을 위험하게 만든다. 안전한 배포는 먼저 nullable 컬럼이나 새 테이블을 추가하고, 구버전과 신버전이 함께 동작하는 기간을 둔 다음, 데이터 전환이 끝난 뒤 오래된 구조를 제거하는 expand-and-contract 방식을 따른다. migration 자체의 되돌리기가 데이터 손실을 만들 수 있다면 즉시 reverse SQL을 실행하지 않고 forward fix를 우선 검토한다.\n\n## 설정과 Secret 확인\n\n새 버전만 시작하지 못한다면 환경변수 이름, Secret mount, profile과 외부 서비스 endpoint 차이를 확인한다. Secret 값 자체를 로그나 채팅에 복사하지 말고 존재 여부, 버전과 주입 경로만 검증한다. 잘못된 API key나 DB password가 원인이어도 값을 출력해서 비교하지 않는다. 설정 변경과 코드 변경이 동시에 배포됐다면 각각의 변경 시각을 분리해 어떤 요소가 장애를 만들었는지 추적한다.\n\n이미지 tag가 재사용됐거나 digest가 환경마다 다르면 같은 버전 이름으로 서로 다른 코드가 실행될 수 있다. 실행 중인 pod의 image digest, Git commit과 build timestamp를 확인한다. ConfigMap이나 Secret 갱신 뒤 기존 pod가 자동으로 새 값을 읽는다고 가정하지 않는다. 설정 반영 방식에 따라 명시적 rollout이 필요하며, 이때도 canary 단계부터 다시 검증한다.\n\n## Rollback 실행\n\nrollback 전에 현재 배포 버전, 대상 이전 버전, DB migration 상태와 데이터 호환성을 한 줄로 정리한다. 이전 버전 이미지가 registry에 존재하고 서명이 유효한지 확인한다. canary 트래픽을 먼저 이전 버전으로 돌리고 핵심 API와 readiness가 회복되는지 본다. 확인되지 않은 상태에서 전체 replica를 동시에 교체하면 복구 실패 시 정상 인스턴스까지 잃을 수 있다.\n\nrollback이 시작되면 배포 자동화가 다시 신버전을 적용하지 않도록 일시 중지 상태를 확인한다. 새 버전이 만든 비동기 작업이나 메시지가 이전 버전에서 처리 가능한지도 검토한다. 스키마가 backward compatible하고 데이터 형식이 유지될 때만 애플리케이션 rollback을 계속한다. 호환되지 않는 데이터가 이미 저장됐다면 해당 경로를 차단하고 forward fix 또는 변환 작업을 선택한다.\n\n## 검증과 종료 기준\n\n이전 버전으로 전환한 뒤 readiness probe 성공만으로 종료하지 않는다. 실제 사용자와 같은 경로의 smoke test를 실행하고 오류율, p95 latency와 처리량을 최소 15분 관찰한다. Flyway 상태가 예상 버전인지, 신규 migration이 남아 있어도 이전 코드가 안전하게 동작하는지 확인한다. canary와 안정 버전 사이에 설정, Secret과 DB endpoint 차이가 없는지도 다시 확인한다.\n\n복구가 확인되면 실패한 버전의 자동 재배포를 막고 incident timeline을 작성한다. timeline에는 최초 canary 시작, readiness 실패, 오류율 임계값 초과, 트래픽 차단, rollback 시작과 회복 시각을 포함한다. 사용자 영향과 처리되지 못한 작업이 있다면 재처리 조건과 멱등성을 확인한다. 임시로 완화한 probe threshold나 배포 정책은 원인 수정 뒤 원래 기준으로 복구한다.\n\n## 재발 방지\n\n배포 파이프라인에는 canary health gate, 핵심 API smoke test와 Flyway validation을 명시적으로 둔다. rollback 연습에서는 애플리케이션 버전뿐 아니라 migration 이후 구버전 호환성도 확인한다. 위험한 스키마 변경은 expand-and-contract 단계와 제거 시점을 ADR 또는 배포 문서에 남긴다. 최종적으로 안전한 rollback은 버튼 하나가 아니라 readiness, canary 지표, 설정 일관성과 DB backward compatibility가 함께 보장될 때 가능한 절차다.\n",
+  "contentSha256" : "2012e66dadfdd0dc75de74d3779ff1d2847bf264a48d34f5fe676e4d4fce5017",
+  "status" : "READY",
+  "embeddingStatus" : "READY",
+  "sourceType" : "MARKDOWN",
+  "retryCount" : 0,
+  "embeddingRetryCount" : 0,
+  "createdAt" : "2026-09-05T00:00:00Z",
+  "updatedAt" : "2026-09-05T00:00:00Z",
+  "chunks" : [ {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 300,
+    "embedded" : true,
+    "content" : "# 배포 실패와 Rollback 대응 Runbook\n\n## 문서 목적\n\n이 문서는 새 버전 배포 중 readiness 실패, 오류율 증가 또는 Flyway migration 문제를 발견했을 때 중단과 rollback을 결정하는 절차다. 배포 성공은 새 컨테이너 프로세스가 시작됐다는 뜻이 아니라 실제 요청을 받을 준비가 됐고 핵심 사용자 흐름이 정상이라는 뜻이다. 대응자는 liveness와 readiness를 구분하고, 애플리케이션 버전과 DB 스키마의 호환성을 확인한 뒤 복구 방법을 선택해야 한다.\n\n## 배포 중단 기준\n\ncanary 단계에서 새 버전의 오류율, p95 latency, readiness 성공률을 이전 버전과 비교한다. readiness probe가 반복 실패하거나 핵심 API의 5xx 비율이 사전 정의한 한도를 넘으면 추가 트래픽 전환을 즉시 멈춘다. 배포 도구의 진행률만 보지 말고 실제 load balancer가 새 pod에 어느 정도 트래픽을 전달했는지 확인한다. 오류가 새 버전에만 집중되면 canary weight를 0으로 낮추는 것이 가장 빠른 격리 수단이다.\n\nliveness probe 실패는 프로세스를 재시작시키지만 readiness probe 실패는 해당 인스턴스를 서비스 대상에서 제외한다. 시작 시간이 긴 애플리케이션에 liveness 임계값을 너무 짧게 두면 정상 초기화 중인 pod가 반복 재시작될 수 있다. 반대로 readiness가 DB 연결, 필수 migration 또는 캐시 준비를 충분히 반영하지 않으면 준비되지 않은 인스턴스가 사용자 요청을 받는다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 574,
+    "chunkIndex" : 0,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 301,
+    "embedded" : true,
+    "content" : "probe 실패 이유와 애플리케이션 시작 로그를 함께 확인해 단순 시간 부족인지 실제 의존성 실패인지 분류한다.\n\n## Flyway와 DB 호환성\n\nFlyway validation 실패가 보이면 적용된 migration checksum과 애플리케이션에 포함된 migration 파일을 비교한다. 이미 운영 DB에 적용된 migration 파일을 수정해서 checksum을 맞추려 하지 않는다. 필요한 변경은 새로운 버전의 migration으로 추가하고, 누가 언제 어떤 환경에 적용했는지 기록한다. migration이 일부 환경에서만 적용됐다면 배포를 계속하기 전에 환경별 `flyway_schema_history` 상태를 확인한다.\n\nDB 스키마 변경이 완료된 뒤 애플리케이션만 이전 버전으로 rollback할 수 있는지 반드시 판단한다. 컬럼 삭제나 타입 변경처럼 이전 코드와 호환되지 않는 migration은 단순 애플리케이션 rollback을 위험하게 만든다. 안전한 배포는 먼저 nullable 컬럼이나 새 테이블을 추가하고, 구버전과 신버전이 함께 동작하는 기간을 둔 다음, 데이터 전환이 끝난 뒤 오래된 구조를 제거하는 expand-and-contract 방식을 따른다. migration 자체의 되돌리기가 데이터 손실을 만들 수 있다면 즉시 reverse SQL을 실행하지 않고 forward fix를 우선 검토한다.\n\n## 설정과 Secret 확인\n\n새 버전만 시작하지 못한다면 환경변수 이름, Secret mount, profile과 외부 서비스 endpoint 차이를 확인한다. Secret 값 자체를 로그나 채팅에 복사하지 말고 존재 여부, 버전과 주입 경로만 검증한다. 잘못된 API key나 DB password가 원인이어도 값을 출력해서 비교하지 않는다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 572,
+    "chunkIndex" : 1,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 302,
+    "embedded" : true,
+    "content" : "설정 변경과 코드 변경이 동시에 배포됐다면 각각의 변경 시각을 분리해 어떤 요소가 장애를 만들었는지 추적한다.\n\n이미지 tag가 재사용됐거나 digest가 환경마다 다르면 같은 버전 이름으로 서로 다른 코드가 실행될 수 있다. 실행 중인 pod의 image digest, Git commit과 build timestamp를 확인한다. ConfigMap이나 Secret 갱신 뒤 기존 pod가 자동으로 새 값을 읽는다고 가정하지 않는다. 설정 반영 방식에 따라 명시적 rollout이 필요하며, 이때도 canary 단계부터 다시 검증한다.\n\n## Rollback 실행\n\nrollback 전에 현재 배포 버전, 대상 이전 버전, DB migration 상태와 데이터 호환성을 한 줄로 정리한다. 이전 버전 이미지가 registry에 존재하고 서명이 유효한지 확인한다. canary 트래픽을 먼저 이전 버전으로 돌리고 핵심 API와 readiness가 회복되는지 본다. 확인되지 않은 상태에서 전체 replica를 동시에 교체하면 복구 실패 시 정상 인스턴스까지 잃을 수 있다.\n\nrollback이 시작되면 배포 자동화가 다시 신버전을 적용하지 않도록 일시 중지 상태를 확인한다. 새 버전이 만든 비동기 작업이나 메시지가 이전 버전에서 처리 가능한지도 검토한다. 스키마가 backward compatible하고 데이터 형식이 유지될 때만 애플리케이션 rollback을 계속한다. 호환되지 않는 데이터가 이미 저장됐다면 해당 경로를 차단하고 forward fix 또는 변환 작업을 선택한다.\n\n## 검증과 종료 기준\n\n이전 버전으로 전환한 뒤 readiness probe 성공만으로 종료하지 않는다. 실제 사용자와 같은 경로의 smoke test를 실행하고 오류율, p95 latency와 처리량을 최소 15분 관찰한다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 571,
+    "chunkIndex" : 2,
+    "embeddingModel" : "illustration"
+  }, {
+    "createdAt" : "2026-09-05T00:00:00Z",
+    "id" : 303,
+    "embedded" : true,
+    "content" : "Flyway 상태가 예상 버전인지, 신규 migration이 남아 있어도 이전 코드가 안전하게 동작하는지 확인한다. canary와 안정 버전 사이에 설정, Secret과 DB endpoint 차이가 없는지도 다시 확인한다.\n\n복구가 확인되면 실패한 버전의 자동 재배포를 막고 incident timeline을 작성한다. timeline에는 최초 canary 시작, readiness 실패, 오류율 임계값 초과, 트래픽 차단, rollback 시작과 회복 시각을 포함한다. 사용자 영향과 처리되지 못한 작업이 있다면 재처리 조건과 멱등성을 확인한다. 임시로 완화한 probe threshold나 배포 정책은 원인 수정 뒤 원래 기준으로 복구한다.\n\n## 재발 방지\n\n배포 파이프라인에는 canary health gate, 핵심 API smoke test와 Flyway validation을 명시적으로 둔다. rollback 연습에서는 애플리케이션 버전뿐 아니라 migration 이후 구버전 호환성도 확인한다. 위험한 스키마 변경은 expand-and-contract 단계와 제거 시점을 ADR 또는 배포 문서에 남긴다. 최종적으로 안전한 rollback은 버튼 하나가 아니라 readiness, canary 지표, 설정 일관성과 DB backward compatibility가 함께 보장될 때 가능한 절차다.",
+    "embeddingProvider" : "demo",
+    "tokenCount" : 414,
+    "chunkIndex" : 3,
+    "embeddingModel" : "illustration"
+  } ]
+} ]
